@@ -1,0 +1,26 @@
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic
+
+# Voice transcription
+openai  # Whisper API
+
+# Orchestration
+langgraph
+langchain-anthropic
+langchain-openai
+
+# Data
+asyncpg
+pgvector
+sqlalchemy[asyncio]
+
+# Google Workspace
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
+# Logging
+structlog
