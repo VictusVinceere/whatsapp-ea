@@ -2,12 +2,21 @@
 
 ## Setup
 
+Install uv once, if you don't have it:
 ```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # fill in real values
-uvicorn main:app --reload
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+Then, from the project root:
+```bash
+uv sync                 # creates .venv, installs deps, writes uv.lock
+cp .env.example .env    # fill in real values
+uv run uvicorn main:app --reload
+```
+
+`uv run` executes inside the project's venv without you needing to
+activate it manually. Adding a new dependency later: `uv add <package>`
+(updates pyproject.toml + uv.lock together, same idea as `npm install --save`).
 
 In a second terminal:
 ```bash
