@@ -4,6 +4,7 @@ POST receives every incoming message. Get text messages round-tripping
 (receive -> print -> send canned reply) before adding anything else.
 """
 
+import hashlib
 import pathlib
 
 import structlog
@@ -77,8 +78,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 async def ingest_whatsapp_document(message: dict, correlation_id: str) -> str:
     """Download a forwarded file, extract its text, and index it.
 
-    source_id is the WhatsApp media id, so re-forwarding the same file
-    replaces its chunks instead of duplicating them -- the same guarantee
+    Keyed by a hash of the bytes, so re-forwarding the same file replaces
+    its chunks instead of duplicating them -- the same guarantee
     app.ingest gets from the file path.
     """
     name = message.get("document_name") or "document"
@@ -95,9 +96,16 @@ async def ingest_whatsapp_document(message: dict, correlation_id: str) -> str:
         # Almost always a scanned PDF: pages of pixels, no text layer.
         return f"{name} has no text I can read -- it may be a scan, which needs OCR."
 
+    # Keyed by content, not by media id. WhatsApp mints a fresh media id
+    # on every forward, so keying on it meant sending the same file twice
+    # indexed it twice -- observed live, one CV stored under two ids. A
+    # hash of the bytes is the same for the same file forever, so a
+    # re-forward replaces its chunks instead of accumulating.
+    digest = hashlib.sha256(data).hexdigest()[:32]
+
     chunks = await ingest_document(
         DEFAULT_TENANT_ID,
-        source_id=f"whatsapp:{message['document_id']}",
+        source_id=f"whatsapp:{digest}",
         source_name=pathlib.Path(name).stem,
         content=content,
     )

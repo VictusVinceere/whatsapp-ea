@@ -149,6 +149,73 @@ where a dev build sent 14 automated replies to a stranger:
   everyone**, which is production behaviour. Set it whenever you test
   against a number real people also message.
 
+## Documents and the index
+
+Three ways in, one search:
+
+```bash
+uv run python -m app.ingest ~/notes    # a local folder (md, txt, pdf, docx)
+```
+forward a file to the bot on WhatsApp, or ask it to index one from Drive.
+
+Chunks are keyed by `source_id`, which encodes where the document came
+from and makes re-indexing idempotent:
+
+| Origin | `source_id` | Re-indexing |
+|---|---|---|
+| local folder | absolute path | replaces on edit |
+| WhatsApp | `whatsapp:<sha256 of bytes>` | replaces on re-forward |
+| Drive | `drive:<file id>` | replaces on re-index |
+
+The WhatsApp key is a **content hash, not the media id**. WhatsApp mints
+a fresh media id on every forward, so keying on it stored the same file
+twice -- observed with one CV under two ids. Hashing the bytes gives the
+same key forever.
+
+### Deleting
+
+Chunks are the only copy of a document's *text*; deleting them removes it
+from search but never touches the original in Drive or on disk.
+
+```bash
+psql $DB -c "DELETE FROM document_chunks WHERE source_id = 'whatsapp:abc123';"
+psql $DB -c "DELETE FROM document_chunks WHERE source_name = 'expenses';"
+psql $DB -c "DELETE FROM document_chunks WHERE source_id LIKE 'whatsapp:%';"
+psql $DB -c "TRUNCATE document_chunks;"   # rebuildable -- re-run app.ingest
+```
+
+### Where this is heading: Drive as the single source of truth
+
+Today the index is *partly* canonical, which is the worst of both worlds
+-- it can't be treated as disposable, and it can't be fully rebuilt. A
+WhatsApp file that was never saved to Drive exists only as chunks, so
+wiping Postgres loses it.
+
+The intended end state is that every chunk traces to a `drive:` id, so
+the index becomes a cache: **Drive canonical, Postgres derived**.
+
+Sync runs one direction only, Drive -> Postgres. Delete in Drive and the
+chunks go stale; delete chunks and nothing happens to Drive, just
+re-index. Two-way sync is deliberately rejected: once "delete locally"
+propagates outward, an indexing bug can destroy documents, and
+simultaneous edits need conflict resolution that is rarely worth owning.
+
+Not built yet, roughly in order:
+
+1. re-key chunks from `whatsapp:` to `drive:` when a file is saved
+2. expire chunks for documents that were never saved
+3. a `synced_at` column, to know what is stale
+4. poll Drive's `changes` API for edits and deletions
+
+Steps 3 and 4 are the actual sync feature; 1 and 2 are bookkeeping worth
+doing sooner, since they stop untraceable chunks accumulating.
+
+**Note the UX cost of the pure version.** If Drive is the only entry
+point, a forwarded document has to be uploaded before it can be indexed
+-- so you would approve the save *before* asking anything about it. The
+middle path keeps today's behaviour: index immediately so questions work
+at once, upload on approval, and re-key the chunks then.
+
 ## Build order — do not skip ahead
 
 1. ~~**Text loop**~~ — done. Real message in, Claude reply out.
