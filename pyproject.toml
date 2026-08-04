@@ -21,3 +21,25 @@ dependencies = [
     "fastembed>=0.8.0",
     "langgraph-checkpoint-postgres>=3.1.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+# Lets async test functions run without an explicit decorator on each one.
+asyncio_mode = "auto"
+# Every test shares one event loop, so the SQLAlchemy engine (created at
+# import time and bound to a loop) stays usable across the whole session.
+asyncio_default_fixture_loop_scope = "session"
+# Tests too, not just fixtures. The SQLAlchemy engine is created at
+# import time and its pooled connections bind to the loop that first
+# used them; a fresh loop per test hands the next test a dead
+# connection ("another operation is in progress").
+asyncio_default_test_loop_scope = "session"
+# tests/ lives beside app/ rather than inside an installed package,
+# so the project root has to be importable.
+pythonpath = ["."]
+testpaths = ["tests"]
