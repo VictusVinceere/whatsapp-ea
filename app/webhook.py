@@ -50,24 +50,28 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     if message is None:
         return {"status": "ignored"}
 
+    # Bound once, here, rather than passed as a kwarg to every log call.
+    # Everything below -- the guards, and the background task this hands
+    # off to -- inherits it automatically. clear first: BackgroundTasks
+    # runs in the request's context, so without it a task could pick up
+    # the previous message's id.
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(correlation_id=message["message_id"])
+
     # Only handle traffic for the number this app is configured to send as.
     # Meta's webhook is app-wide, so every number on the business account
     # arrives here -- without this, a production line's messages get
     # answered by whatever happens to be running locally.
     recipient = message.get("to_phone_number_id")
     if recipient and recipient != settings.whatsapp_phone_number_id:
-        log.info(
-            "foreign_number_ignored",
-            correlation_id=message["message_id"],
-            to_phone_number_id=recipient,
-        )
+        log.info("foreign_number_ignored", to_phone_number_id=recipient)
         return {"status": "ignored"}
 
     # Dev safety net: while testing on a number real customers also use,
     # only answer whitelisted senders. Unset in production.
     allowed = settings.whatsapp_allowed_senders
     if allowed and message["from"] not in allowed:
-        log.info("sender_not_allowed", correlation_id=message["message_id"])
+        log.info("sender_not_allowed")
         return {"status": "ignored"}
 
     log.info("message_received", **{k: v for k, v in message.items() if k != "text"})
@@ -75,7 +79,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     return {"status": "received"}
 
 
-async def ingest_whatsapp_document(message: dict, correlation_id: str) -> str:
+async def ingest_whatsapp_document(message: dict) -> str:
     """Download a forwarded file, extract its text, and index it.
 
     Keyed by a hash of the bytes, so re-forwarding the same file replaces
@@ -89,7 +93,7 @@ async def ingest_whatsapp_document(message: dict, correlation_id: str) -> str:
     try:
         content = extract_text(data, name)
     except Exception:
-        log.exception("document_extract_failed", correlation_id=correlation_id)
+        log.exception("document_extract_failed")
         return f"I couldn't read {name} -- PDF, Word and plain text only."
 
     if not content.strip():
@@ -109,7 +113,7 @@ async def ingest_whatsapp_document(message: dict, correlation_id: str) -> str:
         source_name=pathlib.Path(name).stem,
         content=content,
     )
-    log.info("document_indexed", correlation_id=correlation_id, name=name, chunks=chunks)
+    log.info("document_indexed", name=name, chunks=chunks)
     return f"Indexed {name} ({chunks} sections). Ask me anything about it."
 
 
@@ -126,9 +130,12 @@ async def process_message(message: dict):
     log by Starlette and then dropped, leaving the sender waiting for a
     reply that never arrives.
     """
-    correlation_id = message["message_id"]
     document: dict | None = None
-    log.info("processing_start", correlation_id=correlation_id)
+    # Re-bound rather than assumed. Today this runs in the request's
+    # context and would inherit it; that stops being true the moment the
+    # handoff becomes a real queue.
+    structlog.contextvars.bind_contextvars(correlation_id=message["message_id"])
+    log.info("processing_start")
 
     try:
         if message["type"] == "text":
@@ -138,7 +145,7 @@ async def process_message(message: dict):
             # there was one. Handled here rather than as a tool because
             # the bytes arrive with the message -- the model never sees
             # them and has nothing to decide.
-            reply = await ingest_whatsapp_document(message, correlation_id)
+            reply = await ingest_whatsapp_document(message)
             caption = message.get("document_caption")
             filename = message.get("document_name") or "the document"
 
@@ -170,21 +177,19 @@ async def process_message(message: dict):
             media_url = await get_media_url(message["audio_id"])
             audio_bytes = await download_media(media_url)
             text = await transcribe_audio(audio_bytes)
-            log.info("voice_transcribed", correlation_id=correlation_id, text=text[:80])
+            # What the customer actually said. DEBUG, so it is off by
+            # default and never reaches a log sink in production.
+            log.debug("voice_transcribed", text=text[:80])
         else:
             # WhatsApp labels reactions, view-once, polls and similar as
             # "unsupported" -- the body never reaches us. Staying silent is
             # deliberate: replying meant a canned line went to whoever sent
             # it, including automated senders that never asked for a reply.
-            log.info(
-                "unhandled_type_ignored",
-                correlation_id=correlation_id,
-                type=message["type"],
-            )
+            log.info("unhandled_type_ignored", type=message["type"])
             return
 
         if not text:
-            log.info("empty_text_ignored", correlation_id=correlation_id)
+            log.info("empty_text_ignored")
             return
 
         # Read history *before* storing this turn, or the incoming message
@@ -199,10 +204,10 @@ async def process_message(message: dict):
         )
 
         if not stored:
-            log.info("duplicate_ignored", correlation_id=correlation_id)
+            log.info("duplicate_ignored")
             return
 
-        log.info("history_loaded", correlation_id=correlation_id, turns=len(history))
+        log.info("history_loaded", turns=len(history))
 
         # One call now handles routing, the specialists, and the approval
         # gate. thread_id is the sender's number, so each contact gets
@@ -212,7 +217,7 @@ async def process_message(message: dict):
             message["from"], text, history=history, document=document
         )
     except Exception:
-        log.exception("processing_failed", correlation_id=correlation_id)
+        log.exception("processing_failed")
         reply = "Sorry -- something went wrong on my end. Please try again."
 
     try:
@@ -221,7 +226,7 @@ async def process_message(message: dict):
         # The send is the one step with no fallback: if the Graph API
         # rejects us there is no second channel to apologise over, so log
         # it against the correlation_id and give up on this message.
-        log.exception("send_failed", correlation_id=correlation_id)
+        log.exception("send_failed")
         return
 
     # Only after the reply actually reached the user -- storing a turn we
@@ -230,6 +235,6 @@ async def process_message(message: dict):
     try:
         await save_message(DEFAULT_TENANT_ID, message["from"], "assistant", reply)
     except Exception:
-        log.exception("save_reply_failed", correlation_id=correlation_id)
+        log.exception("save_reply_failed")
 
-    log.info("processing_done", correlation_id=correlation_id)
+    log.info("processing_done")

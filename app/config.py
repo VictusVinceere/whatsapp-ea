@@ -27,6 +27,13 @@ class Settings:
 
     database_url: str = os.getenv("DATABASE_URL", "")
 
+    # DEBUG additionally logs message content -- transcripts of voice
+    # notes, retrieved chunks. Useful when a reply makes no sense and you
+    # need to see what the model actually received; not something to
+    # leave on against a live line, where it ships customer speech to
+    # whatever collects your logs.
+    log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+
     google_client_id: str = os.getenv("GOOGLE_CLIENT_ID", "")
     google_client_secret: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
     google_redirect_uri: str = os.getenv("GOOGLE_REDIRECT_URI", "")

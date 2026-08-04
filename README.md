@@ -1,5 +1,47 @@
 # WhatsApp AI Executive Assistant
 
+A WhatsApp number you can talk to like a chief of staff: forward it a
+document and it becomes searchable, ask it what's on your calendar, tell
+it to email someone — and it asks before doing anything with a
+real-world effect.
+
+## Reading this codebase
+
+Follow one message through the system; the architecture explains itself
+in that order.
+
+```
+WhatsApp  ──▶  webhook.py  ──▶  graph.py  ──▶  llm.py  ──▶  tools.py
+                   │              (agent →       (tool      (read → run now
+              4 guards, then      propose →       loop)      write → ask first)
+              ack immediately     approve)
+```
+
+| Read this | To understand |
+|---|---|
+| `app/webhook.py` | The entry point. Four guards, then hand off to a background task — Meta times out if you answer slowly |
+| `app/graph.py` | LangGraph. Three nodes, and the `interrupt()` that lets an approval survive a process restart |
+| `app/llm.py` | The manual tool-use loop. Written by hand rather than with the SDK's runner, because a write has to suspend mid-loop |
+| `app/tools.py` | The read/write split. Which tools need approval is decided by set membership, never by the model |
+| `app/rag.py` | Chunking, embedding, and the `<=>` similarity search |
+| `app/db.py` | Raw SQL, no ORM. `CONFIRM_ACTION_SQL` is the compare-and-set that makes double-confirm safe |
+| `tests/` | Twenty tests, each one pinning a bug that actually happened |
+
+Three ideas do most of the work, and each has a comment explaining the
+failure that produced it:
+
+- **Ack first, think later.** The webhook returns before the LLM runs.
+- **The model proposes, it does not decide.** Approval is decided by a
+  set in `tools.py`, so a prompt injected into a document cannot talk
+  the assistant out of asking.
+- **State is cumulative.** In LangGraph, *omitting* a key leaves the old
+  value in place. `_clear_pending()` in `graph.py` exists because that
+  once made the bot answer a question with the previous conversation's
+  half-finished action.
+
+Read `CLAUDE.md` next; it holds the conventions, and the build order at
+the bottom of this file is the sequence it was written in.
+
 ## Setup
 
 Install uv once, if you don't have it:
@@ -152,6 +194,58 @@ Graph API actually work, and the only one that can message a stranger.
 Check `WHATSAPP_ALLOWED_SENDERS` is set before you start, and clear the
 callback URL in the Meta dashboard when you stop — otherwise the live
 line keeps forwarding customer messages into a dead tunnel.
+
+## Logging
+
+Every line is JSON on stdout. Nothing writes a log file — in a container
+that's a file nobody will ever read, so collection is the deployment
+platform's job, not the app's.
+
+```bash
+LOG_LEVEL=DEBUG uv run uvicorn main:app --reload   # default INFO
+```
+
+**One `correlation_id` per message, bound once.** `receive_webhook`
+binds the WhatsApp `message_id` into structlog's contextvars, and every
+line for that message inherits it — the guards, the graph, the tool
+calls, the send. So the whole decision chain for one message is a single
+filter:
+
+```bash
+docker compose logs app | grep wamid.HBgLOTk4
+```
+
+It used to be an explicit `correlation_id=` kwarg at fourteen call
+sites. That works until someone adds a fifteenth and forgets, and the
+line that goes missing is the one you needed.
+
+**uvicorn and httpx are included.** They log through stdlib `logging`,
+not structlog, so without `ProcessorFormatter` the process emitted two
+formats on one stream — and the plain-text half, where HTTP-layer
+failures appear, was the half you couldn't query. `httpx` is pinned at
+WARNING on purpose: it logs full request URLs at INFO, and media
+downloads are pre-signed links.
+
+**`DEBUG` includes message content** — voice-note transcripts, retrieved
+chunks. Useful when a reply makes no sense and you need to see what the
+model actually received. Not something to leave on against a live line.
+
+### Before this goes to production
+
+Decisions, not bugs — but make them deliberately:
+
+- **Error tracking is not logging.** `log.exception("processing_failed")`
+  writes a traceback to a stream nobody watches; you find out the bot is
+  broken when a customer tells you. Sentry groups and alerts on
+  exceptions instead. ~5 lines with the FastAPI integration, and worth
+  more here than any log aggregator, because this thing runs unattended.
+- **Phone numbers are logged in full.** Message bodies are excluded, but
+  the sender's number is on every line. Hash it if logs are going to a
+  third-party service.
+- **Where the logs land.** Fly/Railway/Render capture stdout and give
+  you a searchable view for free — start there. Move to Better Stack,
+  Axiom or Grafana Cloud when retention or alerting becomes the
+  limitation, not before.
 
 ## WhatsApp setup
 
