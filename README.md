@@ -61,6 +61,98 @@ In a second terminal:
 ngrok http 8000
 ```
 
+### Or in Docker
+
+```bash
+docker compose up --build
+docker compose exec app python -m app.db     # once, to create the schema
+```
+
+Compose brings up the app and its own pgvector Postgres. Two things
+that are easy to get wrong:
+
+- **Inside the network the database is `db:5432`, not `localhost:5433`.**
+  `docker-compose.yml` overrides `DATABASE_URL` for exactly this reason.
+  The `5433` host mapping exists only so you can still reach it with
+  `psql` from your laptop.
+- **It is a *different* database from the one you have been developing
+  against.** Compose's Postgres has its own volume, so it starts empty —
+  no indexed documents, no Google tokens. You will have to re-authorise
+  and re-index, or dump and restore.
+
+Stop with `docker compose down`; add `-v` only when you actually mean to
+throw the data away.
+
+The image pins two system libraries that nothing in `pyproject.toml`
+declares, because they already exist on a normal machine and only go
+missing once it is containerised: `libgomp1` (onnxruntime, under
+fastembed) and `libpq5` (psycopg 3, under the LangGraph checkpointer).
+The embedding model is downloaded at build time too, so a fresh
+container answers its first message immediately instead of pausing to
+fetch 200MB.
+
+## Testing
+
+Four levels, cheapest first. The first two cost nothing and catch most
+mistakes; only the last one spends Anthropic credit or touches a real
+phone.
+
+**1. The suite** — 20 tests, ~1s, no network and no API keys.
+
+```bash
+uv run pytest -q
+```
+
+These cover the invariants that broke in real use: the double-confirm
+race on `pending_actions`, the read/write tool split, and the state
+clearing in `graph.py` that once made the bot answer a question with
+the *previous* conversation's half-finished action.
+
+**2. The container comes up.** Build, start, then check the parts that
+don't need a model:
+
+```bash
+docker compose up -d --build
+docker compose ps                    # both services should say (healthy)
+docker compose exec app python -m app.db
+docker compose exec db psql -U postgres -d whatsapp_ea -c '\dt'
+```
+
+**3. Fake webhooks with curl.** The webhook is just an HTTP endpoint —
+you can post Meta's payload shape at it yourself. The guards are the
+useful thing to exercise, because they return before any LLM call, so
+they are free:
+
+```bash
+# verification handshake — expect your challenge string back
+curl "http://localhost:8000/webhook?hub.mode=subscribe\
+&hub.verify_token=$WHATSAPP_VERIFY_TOKEN&hub.challenge=OK"
+
+# a message to a different number on the same business account: dropped
+curl -X POST http://localhost:8000/webhook -H 'Content-Type: application/json' -d '{
+  "entry":[{"changes":[{"value":{
+    "metadata":{"phone_number_id":"999999999999"},
+    "messages":[{"from":"15550001234","id":"wamid.TEST1",
+                 "type":"text","text":{"body":"hello"}}]}}]}]}'
+```
+
+Both should answer `{"status":"ignored"}`, and the JSON logs name which
+guard fired (`foreign_number_ignored`, `sender_not_allowed`). Swap in
+your real `phone_number_id` and an allowed sender and the same curl runs
+the whole pipeline — but that one calls Claude and sends a real
+WhatsApp message, so treat it as level 4.
+
+Change the `id` on every call: `_SEEN_MESSAGE_IDS` dedupes replays, so
+re-sending the same payload is silently ignored — which looks exactly
+like a bug if you have forgotten about it.
+
+**4. A real message.** ngrok, the Meta callback URL, your own phone.
+This is the only level that proves transcription, Google OAuth and the
+Graph API actually work, and the only one that can message a stranger.
+Check `WHATSAPP_ALLOWED_SENDERS` is set before you start, and clear the
+callback URL in the Meta dashboard when you stop — otherwise the live
+line keeps forwarding customer messages into a dead tunnel.
+
 ## WhatsApp setup
 
 The fiddliest part of this project, and none of it is Python. Budget an

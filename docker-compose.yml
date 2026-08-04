@@ -1,0 +1,47 @@
+# Whole stack in one command:
+#
+#     docker compose up --build
+#     docker compose exec app python -m app.db     # create the schema
+#
+# Reads .env for secrets. DATABASE_URL is overridden below, because inside
+# the network Postgres is `db:5432`, not localhost:5433 -- the host port
+# mapping only exists for psql from your laptop.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: whatsapp_ea
+    ports:
+      # 5433 on the host to avoid colliding with any other Postgres.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The app crashes on startup if Postgres isn't accepting connections
+      # yet -- the LangGraph checkpointer connects during the lifespan.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d whatsapp_ea"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    env_file: .env
+    environment:
+      # Service name, not localhost. Inside the compose network `db`
+      # resolves to the database container.
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/whatsapp_ea
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        # Waits for the healthcheck, not merely for the container to exist.
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  # Named volume, so `docker compose down` keeps your data. Use
+  # `down -v` to discard it deliberately.
+  pgdata:
