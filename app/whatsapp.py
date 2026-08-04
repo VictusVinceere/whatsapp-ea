@@ -60,6 +60,11 @@ def parse_incoming_message(payload: dict) -> dict | None:
             "type": message["type"],  # "text" | "audio" | ...
             "text": message.get("text", {}).get("body"),
             "audio_id": message.get("audio", {}).get("id"),
+            # Which of our numbers received this. Meta's webhook config is
+            # per-app, not per-number, so every number on the business
+            # account delivers here -- callers must check this before
+            # replying or a live number's traffic gets answered by a dev app.
+            "to_phone_number_id": entry.get("metadata", {}).get("phone_number_id"),
         }
     except (KeyError, IndexError):
         return None

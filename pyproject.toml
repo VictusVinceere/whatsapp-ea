@@ -8,10 +8,9 @@ dependencies = [
     "httpx",
     "python-dotenv",
     "pydantic",
-    "openai",
+    "deepgram-sdk",
     "langgraph",
     "langchain-anthropic",
-    "langchain-openai",
     "asyncpg",
     "pgvector",
     "sqlalchemy[asyncio]",
@@ -19,4 +18,6 @@ dependencies = [
     "google-auth-httplib2",
     "google-auth-oauthlib",
     "structlog",
+    "fastembed>=0.8.0",
+    "langgraph-checkpoint-postgres>=3.1.1",
 ]

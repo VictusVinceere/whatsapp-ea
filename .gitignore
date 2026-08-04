@@ -1,0 +1,29 @@
+# --- Secrets ---
+.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- uv / venv ---
+.venv/
+venv/
+# uv.lock is intentionally NOT ignored -- commit it, same reasoning as
+# committing package-lock.json: it pins exact versions for reproducible installs.
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- ngrok ---
+ngrok
+ngrok.log
+
+# --- Local artifacts ---
+*.log
+whatsapp-ea.zip

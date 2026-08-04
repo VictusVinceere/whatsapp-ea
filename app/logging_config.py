@@ -11,6 +11,11 @@ def configure_logging():
         processors=[
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.add_log_level,
+            # log.exception() attaches exc_info; without this the JSON
+            # renderer falls back to repr() on the raw (type, value, tb)
+            # tuple and the traceback is unreadable. Must precede the
+            # renderer.
+            structlog.processors.format_exc_info,
             structlog.processors.JSONRenderer(),
         ]
     )
