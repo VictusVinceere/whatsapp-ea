@@ -23,8 +23,20 @@ from app.llm import ask_claude
 
 log = structlog.get_logger()
 
-# BAAI/bge-small-en-v1.5, 384 dimensions -- must match vector(384) in the
-# schema. Changing model means a migration and re-embedding everything.
+# Multilingual, 384 dimensions -- the same width as the English-only
+# bge-small-en-v1.5 it replaces, so vector(384) still fits and no
+# migration is needed. Everything already stored must still be
+# re-embedded: vectors from a different model are not comparable, and
+# mixing them silently ranks nonsense above real matches.
+#
+# The switch was forced by a real failure. With the English model, every
+# chunk of a Russian-language PDF scored 0.48-0.50 while *unrelated
+# English documents* scored 0.39-0.44 -- so the answer ranked below
+# documents about expenses and onboarding. An English-only model cannot
+# represent Russian meaning, so relevance stops working rather than
+# degrading gracefully.
+EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
 _model: TextEmbedding | None = None
 
 # Characters, not tokens -- close enough at this scale and far simpler.
@@ -41,7 +53,7 @@ def _get_model() -> TextEmbedding:
     """Loaded on first use, not at import -- keeps app startup fast."""
     global _model
     if _model is None:
-        _model = TextEmbedding()
+        _model = TextEmbedding(model_name=EMBED_MODEL)
     return _model
 
 
@@ -149,7 +161,26 @@ async def ingest_document(
     return len(chunks)
 
 
-async def search(tenant_id: str, query: str, limit: int = 4) -> list[dict]:
+# Cosine distance beyond which a chunk is treated as noise. Defaults off:
+# a first attempt at 0.45 was measured against an English-only model on a
+# partly-Russian corpus, so the numbers described the model's blind spot
+# rather than the documents, and the cutoff removed exactly the chunks
+# holding the answer. Re-measure on your own corpus before enabling one.
+MAX_DISTANCE = 1.0
+
+# Eight rather than four. Four could not answer questions about a 43-chunk
+# PDF: the top matches were all table-of-contents pages, and the real
+# terms ranked below them. The cost is real (618 -> ~1500 tokens per
+# query) and a wrong answer costs more.
+DEFAULT_LIMIT = 8
+
+
+async def search(
+    tenant_id: str,
+    query: str,
+    limit: int = DEFAULT_LIMIT,
+    max_distance: float = MAX_DISTANCE,
+) -> list[dict]:
     """The chunks closest in meaning to `query`, nearest first.
 
     `<=>` is cosine distance: 0 is identical, 2 is opposite. It must match
@@ -180,7 +211,13 @@ async def search(tenant_id: str, query: str, limit: int = 4) -> list[dict]:
         )
         rows = result.mappings().all()
 
-    return [dict(r) for r in rows]
+    # Filtered in Python rather than SQL so the cutoff can be tuned without
+    # touching the query, and so a run that returns nothing is still
+    # visible in the logs as "everything was too far away".
+    kept = [dict(r) for r in rows if r["distance"] <= max_distance]
+    if len(kept) < len(rows):
+        log.info("chunks_filtered", kept=len(kept), dropped=len(rows) - len(kept))
+    return kept
 
 
 async def answer_with_context(tenant_id: str, question: str) -> str:

@@ -17,10 +17,60 @@ import argparse
 import asyncio
 import pathlib
 
+import docx
+import pypdf
+
 from app.db import DEFAULT_TENANT_ID
 from app.rag import ingest_document
 
-DEFAULT_EXTENSIONS = (".md", ".txt", ".markdown", ".rst")
+TEXT_EXTENSIONS = (".md", ".txt", ".markdown", ".rst")
+DEFAULT_EXTENSIONS = TEXT_EXTENSIONS + (".pdf", ".docx")
+
+
+def _read_pdf(path: pathlib.Path) -> str:
+    """Page text, joined with blank lines so chunking can split on them.
+
+    Extraction is best-effort by nature: a PDF stores glyphs at
+    coordinates, not sentences. Multi-column layouts interleave, tables
+    lose their structure, and scanned pages yield nothing at all without
+    OCR. A page that comes back empty is skipped rather than embedded --
+    an empty chunk matches everything weakly and pollutes results.
+    """
+    pages = []
+    reader = pypdf.PdfReader(str(path))
+    for page in reader.pages:
+        text = (page.extract_text() or "").strip()
+        if text:
+            pages.append(text)
+    return "\n\n".join(pages)
+
+
+def _read_docx(path: pathlib.Path) -> str:
+    """Paragraphs and table cells.
+
+    python-docx keeps tables out of document.paragraphs, so a file whose
+    content is mostly tabular extracts as almost nothing unless they are
+    walked separately.
+    """
+    document = docx.Document(str(path))
+    parts = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+
+    for table in document.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                parts.append(" | ".join(cells))
+
+    return "\n\n".join(parts)
+
+
+def read_document(path: pathlib.Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return _read_pdf(path)
+    if suffix == ".docx":
+        return _read_docx(path)
+    return path.read_text(encoding="utf-8")
 
 
 async def ingest_folder(folder: pathlib.Path, extensions: tuple[str, ...]) -> None:
@@ -34,10 +84,18 @@ async def ingest_folder(folder: pathlib.Path, extensions: tuple[str, ...]) -> No
     total = 0
     for path in files:
         try:
-            content = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError) as exc:
-            # One unreadable file shouldn't abandon the whole folder.
+            content = read_document(path)
+        except Exception as exc:
+            # One unreadable file shouldn't abandon the whole folder --
+            # encrypted PDFs and malformed docx are common in any real
+            # directory.
             print(f"  skipped {path.name}: {type(exc).__name__}")
+            continue
+
+        if not content.strip():
+            # Usually a scanned PDF: real pages, no extractable text.
+            # Needs OCR, which is a different problem.
+            print(f"  skipped {path.name}: no extractable text")
             continue
 
         chunks = await ingest_document(

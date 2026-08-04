@@ -34,9 +34,13 @@ from app.calendar_api import calendar_timezone, insert_event
 from app.config import settings
 from app.db import DEFAULT_TENANT_ID, async_session
 from app.google import valid_access_token
-from app.llm import run_agent
+from app.llm import ask_claude, run_agent
 
 log = structlog.get_logger()
+
+NOT_CONNECTED = (
+    "I can't reach your Google account -- connect it first with /oauth/start."
+)
 
 
 class AssistantState(TypedDict, total=False):
@@ -245,6 +249,64 @@ def checkpointer_dsn() -> str:
 # owns a connection pool that must outlive any single request.
 _graph = None
 
+# Unambiguous replies, matched before spending a model call. Anything
+# outside these two sets goes to Claude, because "sure, go ahead" and
+# "actually don't" are answers too, and treating them as new requests
+# would silently cancel what the user just approved.
+YES_WORDS = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure",
+             "confirm", "confirmed", "send", "do it", "go ahead", "please do"}
+NO_WORDS = {"no", "n", "nope", "nah", "cancel", "stop", "don't", "dont",
+            "no thanks", "never mind", "nevermind"}
+
+
+async def _classify_reply(message: str, question: str) -> Literal["yes", "no", "new"]:
+    """Is this an approval, a refusal, or a change of subject?
+
+    Without this every message resumed the interrupt, so an unrelated
+    question while an approval was pending got consumed as a rejection --
+    observed live: "did you send the email to my friend windsor" was eaten
+    as an answer and the conversation sat parked for hours.
+
+    Normalising here rather than inside approve_node is deliberate: two
+    places matching yes/no with different word lists meant "sure, go
+    ahead" passed this check and was then rejected downstream. One
+    matcher, one vocabulary.
+    """
+    normalised = message.strip().lower().rstrip("!.")
+    if normalised in YES_WORDS:
+        return "yes"
+    if normalised in NO_WORDS:
+        return "no"
+
+    verdict = await ask_claude(
+        f"Pending question: {question}\n\nUser said: {message}",
+        system=(
+            "The user was asked to confirm an action. Did they agree, "
+            "decline, or say something unrelated to it? Reply with exactly "
+            "one word: yes, no, or new."
+        ),
+        max_tokens=5,
+    )
+    answer = verdict.strip().lower().rstrip(".!")
+    return answer if answer in {"yes", "no", "new"} else "new"  # type: ignore[return-value]
+
+
+async def _abandon_pending(conversation_id: str) -> None:
+    """Mark the outstanding proposal rejected when the user moves on.
+
+    Conditional on status so it can never overwrite one that was already
+    confirmed -- same reasoning as CONFIRM_ACTION_SQL.
+    """
+    async with async_session() as session:
+        await session.execute(
+            sql(
+                "UPDATE pending_actions SET status = 'rejected' "
+                "WHERE conversation_id = :c AND status = 'pending'"
+            ),
+            {"c": conversation_id},
+        )
+        await session.commit()
+
 
 def set_graph(compiled) -> None:
     global _graph
@@ -270,8 +332,38 @@ async def run_graph(
     state = await _graph.aget_state(config)
 
     if state.next:
-        log.info("graph_resuming", conversation_id=conversation_id, at=state.next)
-        result = await _graph.ainvoke(Command(resume=message), config)
+        question = ""
+        if state.tasks and state.tasks[0].interrupts:
+            question = str(state.tasks[0].interrupts[0].value)
+
+        verdict = await _classify_reply(message, question)
+
+        if verdict in {"yes", "no"}:
+            log.info(
+                "graph_resuming",
+                conversation_id=conversation_id,
+                at=state.next,
+                verdict=verdict,
+            )
+            # The canonical word, not the user's phrasing -- approve_node
+            # matches a fixed vocabulary and "sure, go ahead" isn't in it.
+            result = await _graph.ainvoke(Command(resume=verdict), config)
+        else:
+            # Changed the subject. Decline the pending question to unstick
+            # the graph, then answer what was actually asked. Resuming
+            # first matters: approve_node still needs pending_input to
+            # describe what it is cancelling.
+            log.info("pending_abandoned", conversation_id=conversation_id)
+            await _abandon_pending(conversation_id)
+            await _graph.ainvoke(Command(resume="no"), config)
+            result = await _graph.ainvoke(
+                {
+                    "conversation_id": conversation_id,
+                    "message": message,
+                    "history": history or [],
+                },
+                config,
+            )
     else:
         result = await _graph.ainvoke(
             {
