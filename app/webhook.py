@@ -7,13 +7,9 @@ POST receives every incoming message. Get text messages round-tripping
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Query, Request, Response
 
-from app.agents.calendar_agent import handle_calendar_request
-from app.agents.drive_agent import handle_drive_request
-from app.agents.email_agent import handle_email_request
 from app.config import settings
 from app.db import DEFAULT_TENANT_ID, recent_messages, save_message
-from app.llm import ask_claude
-from app.router_agent import classify_intent
+from app.graph import run_graph
 from app.transcription import transcribe_audio
 from app.whatsapp import (
     download_media,
@@ -131,19 +127,11 @@ async def process_message(message: dict):
 
         log.info("history_loaded", correlation_id=correlation_id, turns=len(history))
 
-        # Route to a specialist, or answer conversationally. Only the
-        # "general" branch gets conversation history -- the agents answer
-        # from their own source of truth (documents, calendar), and
-        # replaying chat history into them just adds noise and tokens.
-        intent = await classify_intent(text)
-        if intent == "drive":
-            reply = await handle_drive_request(text, message["from"])
-        elif intent == "calendar":
-            reply = await handle_calendar_request(text, message["from"])
-        elif intent == "email":
-            reply = await handle_email_request(text, message["from"])
-        else:
-            reply = await ask_claude(text, history=history)
+        # One call now handles routing, the specialists, and the approval
+        # gate. thread_id is the sender's number, so each contact gets
+        # their own graph state -- including a half-finished approval that
+        # survives a restart and resumes when they eventually reply.
+        reply = await run_graph(message["from"], text, history=history)
     except Exception:
         log.exception("processing_failed", correlation_id=correlation_id)
         reply = "Sorry -- something went wrong on my end. Please try again."

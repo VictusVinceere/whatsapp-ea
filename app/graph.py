@@ -25,7 +25,7 @@ from typing import Literal, TypedDict
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 from sqlalchemy import text as sql
 
 from app.agents.drive_agent import handle_drive_request
@@ -46,6 +46,7 @@ class AssistantState(TypedDict, total=False):
     reply: str
     action_id: str
     summary: str
+    history: list[dict]
 
 
 async def route_node(state: AssistantState) -> dict:
@@ -53,7 +54,11 @@ async def route_node(state: AssistantState) -> dict:
 
 
 async def general_node(state: AssistantState) -> dict:
-    return {"reply": await ask_claude(state["message"])}
+    # Only this branch replays conversation history. The specialists answer
+    # from their own source of truth, so chat history is noise and tokens.
+    return {
+        "reply": await ask_claude(state["message"], history=state.get("history"))
+    }
 
 
 async def drive_node(state: AssistantState) -> dict:
@@ -182,3 +187,54 @@ def checkpointer_dsn() -> str:
     dialect prefix has to come off. Still async -- psycopg3 has native
     async support, unlike psycopg2."""
     return settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+
+# Compiled once at startup by main.py's lifespan, because the checkpointer
+# owns a connection pool that must outlive any single request.
+_graph = None
+
+
+def set_graph(compiled) -> None:
+    global _graph
+    _graph = compiled
+
+
+async def run_graph(
+    conversation_id: str,
+    message: str,
+    history: list[dict] | None = None,
+) -> str:
+    """One WhatsApp message through the graph. Returns what to reply.
+
+    A conversation can be mid-approval, so the first job is deciding
+    whether this message *starts* a run or *answers* one. `state.next`
+    being non-empty means the graph is parked on an interrupt, and the
+    message is the user's answer to whatever it asked.
+    """
+    if _graph is None:
+        raise RuntimeError("graph not compiled -- is the lifespan handler running?")
+
+    config = {"configurable": {"thread_id": conversation_id}}
+    state = await _graph.aget_state(config)
+
+    if state.next:
+        log.info("graph_resuming", conversation_id=conversation_id, at=state.next)
+        result = await _graph.ainvoke(Command(resume=message), config)
+    else:
+        result = await _graph.ainvoke(
+            {
+                "conversation_id": conversation_id,
+                "message": message,
+                "history": history or [],
+            },
+            config,
+        )
+
+    # An interrupted run has no "reply" -- what the user should see is the
+    # question the interrupt raised ("Reply YES to confirm...").
+    pending = result.get("__interrupt__")
+    if pending:
+        log.info("graph_interrupted", conversation_id=conversation_id)
+        return pending[0].value
+
+    return result["reply"]
