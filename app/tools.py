@@ -33,18 +33,24 @@ from app.drive_api import (
     suggested_name,
 )
 from app.ingest import extract_text
-from app.rag import ingest_document, search
+from app.rag import ingest_document, list_documents, search
 
 log = structlog.get_logger()
 
 READ_TOOLS = {
     "search_documents",
+    "list_indexed_documents",
     "read_calendar",
     "read_email",
     "list_drive_files",
     "index_drive_file",
 }
-WRITE_TOOLS = {"create_calendar_event", "send_email", "save_to_drive"}
+WRITE_TOOLS = {
+    "create_calendar_event",
+    "send_email",
+    "save_to_drive",
+    "delete_document",
+}
 
 TOOL_DEFINITIONS = [
     {
@@ -95,6 +101,34 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": [],
+        },
+    },
+    {
+        "name": "list_indexed_documents",
+        "description": (
+            "List the documents currently in the searchable index, with how "
+            "many sections each has. Use when the user asks what you can "
+            "search, or before deleting something."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "delete_document",
+        "description": (
+            "Remove a document from the searchable index. This only affects "
+            "search -- the original file in Drive or on disk is untouched. "
+            "Call list_indexed_documents first to get the exact name. The "
+            "user confirms automatically, so do not ask them yourself."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_name": {
+                    "type": "string",
+                    "description": "Name exactly as list_indexed_documents reported it.",
+                }
+            },
+            "required": ["source_name"],
         },
     },
     {
@@ -206,6 +240,15 @@ async def run_read_tool(name: str, tool_input: dict, conversation_id: str) -> st
             f"[{h['source_name']}]\n{h['content']}" for h in hits
         )
 
+    if name == "list_indexed_documents":
+        docs = await list_documents(DEFAULT_TENANT_ID)
+        if not docs:
+            return "Nothing is indexed yet."
+        return "\n".join(
+            f"- {d['source_name']} ({d['chunks']} sections)" for d in docs
+        )
+
+    # Everything below needs Google.
     token = await valid_access_token(DEFAULT_TENANT_ID, conversation_id)
     if token is None:
         return "The user has not connected their Google account."

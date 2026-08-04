@@ -32,6 +32,7 @@ from sqlalchemy import text as sql
 from app.gmail_api import send_message
 from app.calendar_api import calendar_timezone, insert_event
 from app.drive_api import upload_file
+from app.rag import delete_document
 from app.whatsapp import download_media, get_media_url
 from app.config import settings
 from app.db import DEFAULT_TENANT_ID, async_session
@@ -112,6 +113,7 @@ async def propose_node(state: AssistantState) -> dict:
         "create_calendar_event": "calendar",
         "send_email": "email",
         "save_to_drive": "drive",
+        "delete_document": "drive",
     }.get(state["pending_tool"], "unknown")
 
     async with async_session() as session:
@@ -143,6 +145,12 @@ def _describe_pending(tool: str, args: dict) -> str:
     to approve the actual words. An event only needs its parsed time
     restated, which is enough to catch a misread date.
     """
+    if tool == "delete_document":
+        return (
+            f"Remove \"{args.get('source_name')}\" from the search index?\n"
+            "The original file in Drive is not affected."
+        )
+
     if tool == "save_to_drive":
         return f"Save \"{args.get('filename')}\" to your Google Drive?"
 
@@ -217,6 +225,15 @@ async def approve_node(state: AssistantState) -> dict:
                 tz=tz,
             )
             done = f"Done -- \"{args['summary']}\" is on your calendar."
+        elif tool == "delete_document":
+            removed = await delete_document(
+                DEFAULT_TENANT_ID, args["source_name"]
+            )
+            done = (
+                f"Removed \"{args['source_name']}\" ({removed} sections)."
+                if removed
+                else f"Nothing indexed under \"{args['source_name']}\"."
+            )
         elif tool == "save_to_drive":
             # Re-downloaded rather than carried through the approval: the
             # bytes could be megabytes, and pending_actions.payload is a

@@ -220,6 +220,43 @@ async def search(
     return kept
 
 
+async def list_documents(tenant_id: str) -> list[dict]:
+    """What is currently searchable, with chunk counts."""
+    async with async_session() as session:
+        result = await session.execute(
+            text(
+                "SELECT source_name, source_id, count(*) AS chunks, "
+                "       max(created_at) AS indexed_at "
+                "FROM document_chunks WHERE tenant_id = :tenant_id "
+                "GROUP BY source_name, source_id ORDER BY source_name"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        return [dict(r) for r in result.mappings().all()]
+
+
+async def delete_document(tenant_id: str, source_name: str) -> int:
+    """Remove one document from the index. Returns rows deleted.
+
+    Only touches chunks. The original file in Drive or on disk is
+    untouched -- this makes a document unsearchable, it does not destroy
+    it. The confirmation says so, because "delete" reads as more final
+    than it is.
+    """
+    async with async_session() as session:
+        result = await session.execute(
+            text(
+                "DELETE FROM document_chunks "
+                "WHERE tenant_id = :tenant_id AND source_name = :source_name"
+            ),
+            {"tenant_id": tenant_id, "source_name": source_name},
+        )
+        await session.commit()
+
+    log.info("document_deleted", source_name=source_name, chunks=result.rowcount)
+    return result.rowcount
+
+
 async def answer_with_context(tenant_id: str, question: str) -> str:
     """Retrieve, then generate. The whole point of RAG in six lines.
 
