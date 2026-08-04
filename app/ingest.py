@@ -15,6 +15,7 @@ look because layout, tables and columns all affect how the text chunks.
 
 import argparse
 import asyncio
+import io
 import pathlib
 
 import docx
@@ -27,7 +28,22 @@ TEXT_EXTENSIONS = (".md", ".txt", ".markdown", ".rst")
 DEFAULT_EXTENSIONS = TEXT_EXTENSIONS + (".pdf", ".docx")
 
 
-def _read_pdf(path: pathlib.Path) -> str:
+def extract_text(data: bytes, filename: str) -> str:
+    """Text from raw bytes, dispatched on the filename's extension.
+
+    Bytes rather than a path because the same three formats arrive from
+    three places now: the filesystem, a WhatsApp media download, and a
+    Drive export. Only the disk case has a path.
+    """
+    suffix = pathlib.Path(filename).suffix.lower()
+    if suffix == ".pdf":
+        return _read_pdf(io.BytesIO(data))
+    if suffix == ".docx":
+        return _read_docx(io.BytesIO(data))
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_pdf(path) -> str:
     """Page text, joined with blank lines so chunking can split on them.
 
     Extraction is best-effort by nature: a PDF stores glyphs at
@@ -37,7 +53,7 @@ def _read_pdf(path: pathlib.Path) -> str:
     an empty chunk matches everything weakly and pollutes results.
     """
     pages = []
-    reader = pypdf.PdfReader(str(path))
+    reader = pypdf.PdfReader(path)
     for page in reader.pages:
         text = (page.extract_text() or "").strip()
         if text:
@@ -45,14 +61,14 @@ def _read_pdf(path: pathlib.Path) -> str:
     return "\n\n".join(pages)
 
 
-def _read_docx(path: pathlib.Path) -> str:
+def _read_docx(path) -> str:
     """Paragraphs and table cells.
 
     python-docx keeps tables out of document.paragraphs, so a file whose
     content is mostly tabular extracts as almost nothing unless they are
     walked separately.
     """
-    document = docx.Document(str(path))
+    document = docx.Document(path)
     parts = [p.text.strip() for p in document.paragraphs if p.text.strip()]
 
     for table in document.tables:
@@ -65,12 +81,8 @@ def _read_docx(path: pathlib.Path) -> str:
 
 
 def read_document(path: pathlib.Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return _read_pdf(path)
-    if suffix == ".docx":
-        return _read_docx(path)
-    return path.read_text(encoding="utf-8")
+    """Disk convenience wrapper -- one extraction path, not two."""
+    return extract_text(path.read_bytes(), path.name)
 
 
 async def ingest_folder(folder: pathlib.Path, extensions: tuple[str, ...]) -> None:

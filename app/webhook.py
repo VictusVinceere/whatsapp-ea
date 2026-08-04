@@ -4,12 +4,16 @@ POST receives every incoming message. Get text messages round-tripping
 (receive -> print -> send canned reply) before adding anything else.
 """
 
+import pathlib
+
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Query, Request, Response
 
 from app.config import settings
 from app.db import DEFAULT_TENANT_ID, recent_messages, save_message
 from app.graph import run_graph
+from app.ingest import extract_text
+from app.rag import ingest_document
 from app.transcription import transcribe_audio
 from app.whatsapp import (
     download_media,
@@ -70,6 +74,37 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     return {"status": "received"}
 
 
+async def ingest_whatsapp_document(message: dict, correlation_id: str) -> str:
+    """Download a forwarded file, extract its text, and index it.
+
+    source_id is the WhatsApp media id, so re-forwarding the same file
+    replaces its chunks instead of duplicating them -- the same guarantee
+    app.ingest gets from the file path.
+    """
+    name = message.get("document_name") or "document"
+    media_url = await get_media_url(message["document_id"])
+    data = await download_media(media_url)
+
+    try:
+        content = extract_text(data, name)
+    except Exception:
+        log.exception("document_extract_failed", correlation_id=correlation_id)
+        return f"I couldn't read {name} -- PDF, Word and plain text only."
+
+    if not content.strip():
+        # Almost always a scanned PDF: pages of pixels, no text layer.
+        return f"{name} has no text I can read -- it may be a scan, which needs OCR."
+
+    chunks = await ingest_document(
+        DEFAULT_TENANT_ID,
+        source_id=f"whatsapp:{message['document_id']}",
+        source_name=pathlib.Path(name).stem,
+        content=content,
+    )
+    log.info("document_indexed", correlation_id=correlation_id, name=name, chunks=chunks)
+    return f"Indexed {name} ({chunks} sections). Ask me anything about it."
+
+
 async def process_message(message: dict):
     """This is where the pipeline grows over the build:
     step 1 (done): text loop, canned reply
@@ -89,6 +124,18 @@ async def process_message(message: dict):
     try:
         if message["type"] == "text":
             text = message["text"]
+        elif message["type"] == "document":
+            # Forwarding a file indexes it, then answers the caption if
+            # there was one. Handled here rather than as a tool because
+            # the bytes arrive with the message -- the model never sees
+            # them and has nothing to decide.
+            reply = await ingest_whatsapp_document(message, correlation_id)
+            text = message.get("document_caption")
+            if not text:
+                await send_text_message(to=message["from"], body=reply)
+                log.info("processing_done", correlation_id=correlation_id)
+                return
+
         elif message["type"] == "audio":
             media_url = await get_media_url(message["audio_id"])
             audio_bytes = await download_media(media_url)

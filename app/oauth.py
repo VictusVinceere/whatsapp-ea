@@ -31,11 +31,18 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 # Read and write are siblings here, not nested, so both Gmail scopes are
 # needed to do both jobs. Widening this list forces every connected user
 # to re-consent, so add a scope when an agent needs it, not before.
+#   drive.readonly   read existing files, including Google Docs export
+#   drive.file       create files -- narrow by design: it grants access
+#                    only to files this app creates, not the whole Drive,
+#                    so an upload feature cannot become a read-everything
+#                    feature by accident
 SCOPES = " ".join(
     (
         "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/drive.file",
     )
 )
 

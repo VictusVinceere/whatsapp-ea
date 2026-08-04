@@ -60,6 +60,14 @@ def parse_incoming_message(payload: dict) -> dict | None:
             "type": message["type"],  # "text" | "audio" | ...
             "text": message.get("text", {}).get("body"),
             "audio_id": message.get("audio", {}).get("id"),
+            # A forwarded PDF or docx. Same two-step media fetch as voice
+            # notes -- an id, not bytes. filename matters: the extractor
+            # dispatches on the extension, and WhatsApp is the only place
+            # that knows what the file was called.
+            "document_id": message.get("document", {}).get("id"),
+            "document_name": message.get("document", {}).get("filename"),
+            # A caption on the document, if the user typed one.
+            "document_caption": message.get("document", {}).get("caption"),
             # Which of our numbers received this. Meta's webhook config is
             # per-app, not per-number, so every number on the business
             # account delivers here -- callers must check this before

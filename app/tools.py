@@ -25,11 +25,25 @@ from app.calendar_api import describe_events, list_events
 from app.db import DEFAULT_TENANT_ID
 from app.gmail_api import describe_messages, list_recent
 from app.google import valid_access_token
-from app.rag import search
+from app.drive_api import (
+    describe_files,
+    fetch_file,
+    is_readable,
+    list_files as list_drive_files,
+    suggested_name,
+)
+from app.ingest import extract_text
+from app.rag import ingest_document, search
 
 log = structlog.get_logger()
 
-READ_TOOLS = {"search_documents", "read_calendar", "read_email"}
+READ_TOOLS = {
+    "search_documents",
+    "read_calendar",
+    "read_email",
+    "list_drive_files",
+    "index_drive_file",
+}
 WRITE_TOOLS = {"create_calendar_event", "send_email"}
 
 TOOL_DEFINITIONS = [
@@ -81,6 +95,39 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": [],
+        },
+    },
+    {
+        "name": "list_drive_files",
+        "description": (
+            "List recent files in the user's Google Drive. Use when they "
+            "ask what documents they have, or before indexing one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "max_results": {"type": "integer", "description": "Default 15."}
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "index_drive_file",
+        "description": (
+            "Download a Drive file and add it to the searchable index, so "
+            "search_documents can answer from it. Call list_drive_files "
+            "first to get the exact name. Indexing is read-only and takes "
+            "a few seconds for a long document."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "File name exactly as list_drive_files reported it.",
+                }
+            },
+            "required": ["name"],
         },
     },
     {
@@ -148,6 +195,45 @@ async def run_read_tool(name: str, tool_input: dict, conversation_id: str) -> st
             token, max_results=int(tool_input.get("max_results") or 8)
         )
         return describe_events(events)
+
+    if name == "list_drive_files":
+        files = await list_drive_files(
+            token, max_results=int(tool_input.get("max_results") or 15)
+        )
+        return describe_files(files)
+
+    if name == "index_drive_file":
+        # Matched by name because that is what the user and the model
+        # both saw; the id never leaves this module.
+        wanted = (tool_input.get("name") or "").strip().lower()
+        files = await list_drive_files(token, max_results=50)
+        match = next((f for f in files if f["name"].strip().lower() == wanted), None)
+        if match is None:
+            match = next((f for f in files if wanted in f["name"].strip().lower()), None)
+        if match is None:
+            return f"No Drive file called {tool_input.get('name')!r}."
+
+        if not is_readable(match["mimeType"]):
+            return f"{match['name']} is not a text document, so there is nothing to index."
+
+        data = await fetch_file(token, match["id"], match["mimeType"])
+        filename = suggested_name(match["name"], match["mimeType"])
+        try:
+            content = extract_text(data, filename)
+        except Exception:
+            log.exception("drive_extract_failed", name=match["name"])
+            return f"Couldn't read {match['name']}."
+
+        if not content.strip():
+            return f"{match['name']} has no extractable text -- it may be a scan."
+
+        chunks = await ingest_document(
+            DEFAULT_TENANT_ID,
+            source_id=f"drive:{match['id']}",
+            source_name=match["name"],
+            content=content,
+        )
+        return f"Indexed {match['name']} as {chunks} sections. It is now searchable."
 
     if name == "read_email":
         messages = await list_recent(
