@@ -31,6 +31,7 @@ from langgraph.types import Command, interrupt
 from sqlalchemy import text as sql
 
 from app.agents.drive_agent import handle_drive_request
+from app.gmail_api import describe_messages, list_recent, send_message
 from app.calendar_api import (
     calendar_timezone,
     describe_events,
@@ -61,6 +62,10 @@ class AssistantState(TypedDict, total=False):
     event_start: str
     event_duration: int
     event_tz: str
+    email_op: str
+    email_to: str
+    email_subject: str
+    email_body: str
 
 
 async def route_node(state: AssistantState) -> dict:
@@ -80,8 +85,164 @@ async def drive_node(state: AssistantState) -> dict:
     return {"reply": reply}
 
 
-async def email_node(state: AssistantState) -> dict:
-    return {"reply": "Email agent not wired up yet."}
+DRAFT_PROMPT = """The user wants to send an email. Extract the details.
+
+Reply with ONLY a JSON object, no prose, no code fence:
+{"to": "<email address>", "subject": "<short subject>", "body": "<the message>"}
+
+Write the body as a complete, polite email in the user's voice. If no
+recipient address is given, use "" for `to` -- do not invent one."""
+
+
+async def email_triage_node(state: AssistantState) -> dict:
+    """Reading mail and sending it are different risks -- same split as
+    calendar. Drafting happens here so a failed parse never leaves a
+    half-written pending_actions row."""
+    token = await valid_access_token(DEFAULT_TENANT_ID, state["conversation_id"])
+    if token is None:
+        return {"email_op": "unconnected"}
+
+    verdict = await ask_claude(
+        state["message"],
+        system=(
+            "Does this message ask to SEND an email, or only to READ or "
+            "search existing mail? Reply with one word: send or read."
+        ),
+        max_tokens=5,
+    )
+    if "send" not in verdict.strip().lower():
+        return {"email_op": "read"}
+
+    raw = await ask_claude(state["message"], system=DRAFT_PROMPT, max_tokens=600)
+    try:
+        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```")
+        draft = json.loads(cleaned)
+    except Exception:
+        log.warning("email_parse_failed", raw=raw[:120])
+        return {"email_op": "unparsed"}
+
+    # A missing recipient is the common case -- "email Sarah about the
+    # launch" has no address in it. Better to ask than to guess, and far
+    # better than sending to an invented address.
+    if not draft.get("to"):
+        return {"email_op": "no_recipient"}
+
+    return {
+        "email_op": "send",
+        "email_to": draft["to"],
+        "email_subject": draft.get("subject") or "(no subject)",
+        "email_body": draft.get("body") or "",
+    }
+
+
+async def email_read_node(state: AssistantState) -> dict:
+    token = await valid_access_token(DEFAULT_TENANT_ID, state["conversation_id"])
+    messages = await list_recent(token, max_results=6)
+
+    reply = await ask_claude(
+        f"Inbox:\n{describe_messages(messages)}\n\nQuestion: {state['message']}",
+        system=(
+            "Answer from the inbox listing. Brief and conversational -- "
+            "this is WhatsApp, not a report."
+        ),
+    )
+    return {"reply": reply}
+
+
+async def email_unavailable_node(state: AssistantState) -> dict:
+    reasons = {
+        "unconnected": NOT_CONNECTED,
+        "no_recipient": "Who should I send it to? I need an email address.",
+        "unparsed": "I couldn't work out what to send -- try \"email sam@x.com about the launch\".",
+    }
+    return {"reply": reasons.get(state.get("email_op"), NOT_CONNECTED)}
+
+
+async def email_propose_node(state: AssistantState) -> dict:
+    """Store the draft. Separate node from the wait, for the same reason
+    calendar_propose is -- a node holding interrupt() re-runs on resume."""
+    payload = {
+        "to": state["email_to"],
+        "subject": state["email_subject"],
+        "body": state["email_body"],
+    }
+
+    async with async_session() as session:
+        result = await session.execute(
+            sql(
+                "INSERT INTO pending_actions "
+                "(conversation_id, agent, action_type, payload) "
+                "VALUES (:conversation_id, 'email', 'send_email', "
+                "CAST(:payload AS jsonb)) RETURNING id"
+            ),
+            {
+                "conversation_id": state["conversation_id"],
+                "payload": json.dumps(payload),
+            },
+        )
+        action_id = str(result.scalar_one())
+        await session.commit()
+
+    log.info("action_proposed", action_id=action_id, agent="email")
+    return {"action_id": action_id}
+
+
+async def email_approve_node(state: AssistantState) -> dict:
+    """Show the whole draft before sending. An email is unrecallable, so
+    the confirmation quotes it in full rather than summarising -- the
+    user should approve the actual text, not a description of it."""
+    action_id = state["action_id"]
+
+    answer = interrupt(
+        f"Send this?\n\nTo: {state['email_to']}\n"
+        f"Subject: {state['email_subject']}\n\n{state['email_body']}\n\n"
+        "Reply YES or NO."
+    )
+
+    if str(answer).strip().lower() not in {"yes", "y", "confirm", "ok", "send"}:
+        async with async_session() as session:
+            await session.execute(
+                sql(
+                    "UPDATE pending_actions SET status = 'rejected' "
+                    "WHERE id = CAST(:id AS uuid) AND status = 'pending'"
+                ),
+                {"id": action_id},
+            )
+            await session.commit()
+        return {"reply": "Cancelled, nothing was sent."}
+
+    async with async_session() as session:
+        result = await session.execute(
+            sql(
+                "UPDATE pending_actions SET status = 'confirmed' "
+                "WHERE id = CAST(:id AS uuid) AND status = 'pending' RETURNING id"
+            ),
+            {"id": action_id},
+        )
+        won_the_race = result.first() is not None
+        await session.commit()
+
+    if not won_the_race:
+        log.info("action_already_handled", action_id=action_id)
+        return {"reply": "That was already sent."}
+
+    token = await valid_access_token(DEFAULT_TENANT_ID, state["conversation_id"])
+    if token is None:
+        return {"reply": NOT_CONNECTED}
+
+    try:
+        await send_message(
+            token,
+            to=state["email_to"],
+            subject=state["email_subject"],
+            body=state["email_body"],
+        )
+    except Exception:
+        log.exception("email_send_failed", action_id=action_id)
+        return {"reply": "I couldn't send that -- Gmail rejected it. Nothing was sent."}
+
+    log.info("action_executed", action_id=action_id, agent="email")
+    return {"reply": f"Sent to {state['email_to']}."}
 
 
 NOT_CONNECTED = (
@@ -300,6 +461,11 @@ def _calendar_branch(state: AssistantState) -> Literal["read", "write", "unavail
     return operation if operation in {"read", "write"} else "unavailable"
 
 
+def _email_branch(state: AssistantState) -> Literal["read", "send", "unavailable"]:
+    operation = state.get("email_op", "read")
+    return operation if operation in {"read", "send"} else "unavailable"
+
+
 def build_graph() -> StateGraph:
     builder = StateGraph(AssistantState)
     builder.add_node("route", route_node)
@@ -309,7 +475,11 @@ def build_graph() -> StateGraph:
     builder.add_node("calendar_approve", calendar_approve_node)
     builder.add_node("calendar_unavailable", calendar_unavailable_node)
     builder.add_node("drive", drive_node)
-    builder.add_node("email", email_node)
+    builder.add_node("email", email_triage_node)
+    builder.add_node("email_read", email_read_node)
+    builder.add_node("email_propose", email_propose_node)
+    builder.add_node("email_approve", email_approve_node)
+    builder.add_node("email_unavailable", email_unavailable_node)
     builder.add_node("general", general_node)
 
     builder.add_edge(START, "route")
@@ -329,12 +499,25 @@ def build_graph() -> StateGraph:
     # the wait -- see calendar_propose_node.
     builder.add_edge("calendar_propose", "calendar_approve")
 
+    builder.add_conditional_edges(
+        "email",
+        _email_branch,
+        {
+            "read": "email_read",
+            "send": "email_propose",
+            "unavailable": "email_unavailable",
+        },
+    )
+    builder.add_edge("email_propose", "email_approve")
+
     for node in (
         "calendar_read",
         "calendar_approve",
         "calendar_unavailable",
+        "email_read",
+        "email_approve",
+        "email_unavailable",
         "drive",
-        "email",
         "general",
     ):
         builder.add_edge(node, END)
