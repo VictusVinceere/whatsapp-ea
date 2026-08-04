@@ -156,20 +156,21 @@ where a dev build sent 14 automated replies to a stranger:
    Deepgram (not Whisper; see `app/transcription.py`).
 3. ~~**Single LLM call**~~ — done. `ask_claude` in `app/llm.py`, direct
    Anthropic SDK, no framework.
-4. **Postgres** — schema done (`pending_actions`, `messages`), *no code
-   uses it yet*. `db.py` is imported by nobody. Next: `save_message` /
-   `recent_messages`, then wire into `process_message` so the assistant
-   remembers a conversation.
-5. **One specialist agent**: build `calendar_agent.py` for real —
-   OAuth + a real Calendar read call.
-6. **Approval gate**: wrap the calendar agent's actions in
-   `pending_actions`, using `CONFIRM_ACTION_SQL`'s conditional update
-   to avoid a double-confirm race.
-7. **Router + remaining agents**: only once 5+6 work cleanly, wire up
-   `router_agent.py` for real and copy the pattern to email/drive.
-   Drive is the RAG one — needs `CREATE EXTENSION vector`, a chunks
-   table, and an embedding provider. **Anthropic has no embeddings
-   API**; Voyage AI is the recommended pairing.
+4. ~~**Postgres**~~ — done. `save_message` / `recent_messages` give the
+   assistant conversation memory; dedupe moved from an in-process set to
+   a UNIQUE constraint so it survives restarts.
+5. ~~**One specialist agent**~~ — done. Google OAuth with a signed
+   `state`, token refresh, real Calendar reads and writes.
+6. ~~**Approval gate**~~ — done. `pending_actions` plus
+   `CONFIRM_ACTION_SQL`'s conditional update; two simultaneous confirms
+   produce exactly one action, and there's a test for it.
+7. ~~**Router + remaining agents**~~ — done, then replaced. The router
+   classified each message into one of four labels, so "pull my last
+   events and last email" matched neither and fell through to chat.
+   Claude now gets the tools (`app/tools.py`) and calls whichever it
+   needs, however many. RAG runs on pgvector with local embeddings via
+   fastembed — **Anthropic has no embeddings API**, so that or Voyage AI
+   is the choice.
 8. **Deploy** (last): Docker → DigitalOcean K8s → Terraform. Not before
    step 7 works locally end to end.
 
