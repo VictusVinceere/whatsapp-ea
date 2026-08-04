@@ -44,7 +44,7 @@ READ_TOOLS = {
     "list_drive_files",
     "index_drive_file",
 }
-WRITE_TOOLS = {"create_calendar_event", "send_email"}
+WRITE_TOOLS = {"create_calendar_event", "send_email", "save_to_drive"}
 
 TOOL_DEFINITIONS = [
     {
@@ -128,6 +128,26 @@ TOOL_DEFINITIONS = [
                 }
             },
             "required": ["name"],
+        },
+    },
+    {
+        "name": "save_to_drive",
+        "description": (
+            "Save the document the user just sent to their Google Drive, so "
+            "the original file is kept rather than only its indexed text. "
+            "Call this whenever they ask to save or back up a file they just "
+            "forwarded. The user is asked to confirm automatically before "
+            "anything uploads, so do not ask them yourself -- just call it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "Name of the file the user just sent.",
+                }
+            },
+            "required": ["filename"],
         },
     },
     {

@@ -31,6 +31,8 @@ from sqlalchemy import text as sql
 
 from app.gmail_api import send_message
 from app.calendar_api import calendar_timezone, insert_event
+from app.drive_api import upload_file
+from app.whatsapp import download_media, get_media_url
 from app.config import settings
 from app.db import DEFAULT_TENANT_ID, async_session
 from app.google import valid_access_token
@@ -56,6 +58,9 @@ class AssistantState(TypedDict, total=False):
     # "read" answers straight away; "write" goes through the approval gate.
     pending_tool: str
     pending_input: dict
+    # {media_id, filename, mime_type} of a file forwarded with
+    # this message. Supplied by the webhook, not the model.
+    document: dict
 
 
 def _clear_pending(reply: str) -> dict:
@@ -89,10 +94,13 @@ async def agent_node(state: AssistantState) -> dict:
 
     if "pending" in outcome:
         pending = outcome["pending"]
-        return {
-            "pending_tool": pending["name"],
-            "pending_input": pending["input"],
-        }
+        args = dict(pending["input"])
+        if pending["name"] == "save_to_drive":
+            # The model knows a file arrived but not how to fetch it, and
+            # it should not: a media id in tool input is something a
+            # prompt injection could rewrite. Taken from state instead.
+            args.update(state.get("document") or {})
+        return {"pending_tool": pending["name"], "pending_input": args}
     return _clear_pending(outcome["reply"])
 
 
@@ -100,7 +108,11 @@ async def propose_node(state: AssistantState) -> dict:
     """Record the proposed write. Its own node because a node containing
     interrupt() re-runs from the top on resume -- see the docstring on
     approve_node."""
-    agent = "calendar" if state["pending_tool"] == "create_calendar_event" else "email"
+    agent = {
+        "create_calendar_event": "calendar",
+        "send_email": "email",
+        "save_to_drive": "drive",
+    }.get(state["pending_tool"], "unknown")
 
     async with async_session() as session:
         result = await session.execute(
@@ -131,6 +143,9 @@ def _describe_pending(tool: str, args: dict) -> str:
     to approve the actual words. An event only needs its parsed time
     restated, which is enough to catch a misread date.
     """
+    if tool == "save_to_drive":
+        return f"Save \"{args.get('filename')}\" to your Google Drive?"
+
     if tool == "send_email":
         return (
             f"Send this?\n\nTo: {args.get('to')}\n"
@@ -202,6 +217,19 @@ async def approve_node(state: AssistantState) -> dict:
                 tz=tz,
             )
             done = f"Done -- \"{args['summary']}\" is on your calendar."
+        elif tool == "save_to_drive":
+            # Re-downloaded rather than carried through the approval: the
+            # bytes could be megabytes, and pending_actions.payload is a
+            # JSONB audit record, not a blob store.
+            media_url = await get_media_url(args["media_id"])
+            data = await download_media(media_url)
+            uploaded = await upload_file(
+                token,
+                name=args["filename"],
+                data=data,
+                mime_type=args.get("mime_type") or "application/octet-stream",
+            )
+            done = f"Saved \"{uploaded.get('name')}\" to your Drive."
         else:
             await send_message(
                 token, to=args["to"], subject=args["subject"], body=args["body"]
@@ -317,6 +345,7 @@ async def run_graph(
     conversation_id: str,
     message: str,
     history: list[dict] | None = None,
+    document: dict | None = None,
 ) -> str:
     """One WhatsApp message through the graph. Returns what to reply.
 
@@ -361,6 +390,7 @@ async def run_graph(
                     "conversation_id": conversation_id,
                     "message": message,
                     "history": history or [],
+                    "document": document or {},
                 },
                 config,
             )
@@ -370,6 +400,7 @@ async def run_graph(
                 "conversation_id": conversation_id,
                 "message": message,
                 "history": history or [],
+                "document": document or {},
             },
             config,
         )

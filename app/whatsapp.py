@@ -68,6 +68,7 @@ def parse_incoming_message(payload: dict) -> dict | None:
             "document_name": message.get("document", {}).get("filename"),
             # A caption on the document, if the user typed one.
             "document_caption": message.get("document", {}).get("caption"),
+            "document_mime_type": message.get("document", {}).get("mime_type"),
             # Which of our numbers received this. Meta's webhook config is
             # per-app, not per-number, so every number on the business
             # account delivers here -- callers must check this before

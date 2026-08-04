@@ -119,6 +119,7 @@ async def process_message(message: dict):
     reply that never arrives.
     """
     correlation_id = message["message_id"]
+    document: dict | None = None
     log.info("processing_start", correlation_id=correlation_id)
 
     try:
@@ -131,20 +132,30 @@ async def process_message(message: dict):
             # them and has nothing to decide.
             reply = await ingest_whatsapp_document(message, correlation_id)
             caption = message.get("document_caption")
-
-            if not caption:
-                await send_text_message(to=message["from"], body=reply)
-                log.info("processing_done", correlation_id=correlation_id)
-                return
-
-            # The caption alone reads as though nothing was attached --
-            # "rate my CV" with no file in sight, so the model asks the
-            # user to send one they just sent. Name the document, so it
-            # knows to search rather than ask.
             filename = message.get("document_name") or "the document"
+
+            # Passed to the graph so save_to_drive can fetch the bytes
+            # without the model ever seeing a media id.
+            document = {
+                "media_id": message["document_id"],
+                "filename": filename,
+                "mime_type": message.get("document_mime_type"),
+            }
+
+            # Indexing keeps the text; the original file is otherwise
+            # discarded. Offer to keep it, but ask -- an upload is a write
+            # with real-world effect, so it goes through the same gate as
+            # sending an email.
             text = (
                 f'I just sent you a file called "{filename}". '
-                f"It is already indexed and searchable. {caption}"
+                f"It is already indexed and searchable. "
+                + (
+                    caption
+                    # An instruction, not "offer to" -- the model reads
+                    # that as "ask first", which duplicates the approval
+                    # gate and then never calls the tool at all.
+                    or "Save it to my Google Drive so the original is kept."
+                )
             )
 
         elif message["type"] == "audio":
@@ -189,7 +200,9 @@ async def process_message(message: dict):
         # gate. thread_id is the sender's number, so each contact gets
         # their own graph state -- including a half-finished approval that
         # survives a restart and resumes when they eventually reply.
-        reply = await run_graph(message["from"], text, history=history)
+        reply = await run_graph(
+            message["from"], text, history=history, document=document
+        )
     except Exception:
         log.exception("processing_failed", correlation_id=correlation_id)
         reply = "Sorry -- something went wrong on my end. Please try again."
