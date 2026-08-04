@@ -24,9 +24,11 @@ router = APIRouter()
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
-# Read-only for now. Widening scope later forces every user to re-consent,
-# so add calendar.events / gmail / drive only when an agent needs them.
-SCOPES = "https://www.googleapis.com/auth/calendar.readonly"
+# calendar.events covers reading AND writing events, so it replaces
+# calendar.readonly rather than joining it. Widening scope forces every
+# already-connected user to re-consent -- add a scope only when an agent
+# actually needs it, not speculatively.
+SCOPES = "https://www.googleapis.com/auth/calendar.events"
 
 
 def _sign(value: str) -> str:
