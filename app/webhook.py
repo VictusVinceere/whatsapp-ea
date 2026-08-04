@@ -130,11 +130,22 @@ async def process_message(message: dict):
             # the bytes arrive with the message -- the model never sees
             # them and has nothing to decide.
             reply = await ingest_whatsapp_document(message, correlation_id)
-            text = message.get("document_caption")
-            if not text:
+            caption = message.get("document_caption")
+
+            if not caption:
                 await send_text_message(to=message["from"], body=reply)
                 log.info("processing_done", correlation_id=correlation_id)
                 return
+
+            # The caption alone reads as though nothing was attached --
+            # "rate my CV" with no file in sight, so the model asks the
+            # user to send one they just sent. Name the document, so it
+            # knows to search rather than ask.
+            filename = message.get("document_name") or "the document"
+            text = (
+                f'I just sent you a file called "{filename}". '
+                f"It is already indexed and searchable. {caption}"
+            )
 
         elif message["type"] == "audio":
             media_url = await get_media_url(message["audio_id"])
