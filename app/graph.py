@@ -54,6 +54,21 @@ class AssistantState(TypedDict, total=False):
     pending_input: dict
 
 
+def _clear_pending(reply: str) -> dict:
+    """A reply, plus an explicit reset of the pending write.
+
+    LangGraph state is cumulative per thread, and thread_id here is the
+    conversation, so a field set on one message is still set on the next.
+    Leaving pending_tool behind meant _needs_approval saw a finished
+    action and re-proposed it: asking for an email got the previous
+    calendar event offered again, and confirming it created a duplicate.
+
+    Returning None is not the same as omitting the key -- omitting merges
+    nothing and the stale value survives.
+    """
+    return {"reply": reply, "pending_tool": None, "pending_input": None}
+
+
 async def agent_node(state: AssistantState) -> dict:
     """Claude with tools. Answers directly, or proposes a write.
 
@@ -74,7 +89,7 @@ async def agent_node(state: AssistantState) -> dict:
             "pending_tool": pending["name"],
             "pending_input": pending["input"],
         }
-    return {"reply": outcome["reply"]}
+    return _clear_pending(outcome["reply"])
 
 
 async def propose_node(state: AssistantState) -> dict:
@@ -151,7 +166,7 @@ async def approve_node(state: AssistantState) -> dict:
                 {"id": action_id},
             )
             await session.commit()
-        return {"reply": "Cancelled, nothing was changed."}
+        return _clear_pending("Cancelled, nothing was changed.")
 
     async with async_session() as session:
         result = await session.execute(
@@ -166,11 +181,11 @@ async def approve_node(state: AssistantState) -> dict:
 
     if not won_the_race:
         log.info("action_already_handled", action_id=action_id)
-        return {"reply": "That was already done."}
+        return _clear_pending("That was already done.")
 
     token = await valid_access_token(DEFAULT_TENANT_ID, state["conversation_id"])
     if token is None:
-        return {"reply": NOT_CONNECTED}
+        return _clear_pending(NOT_CONNECTED)
 
     try:
         if tool == "create_calendar_event":
@@ -193,10 +208,10 @@ async def approve_node(state: AssistantState) -> dict:
         # up for a second approval, and exactly-one-winner is the whole
         # point of the conditional UPDATE.
         log.exception("action_failed", action_id=action_id, tool=tool)
-        return {"reply": "I couldn't do that -- Google rejected it. Nothing changed."}
+        return _clear_pending("I couldn't do that -- Google rejected it. Nothing changed.")
 
     log.info("action_executed", action_id=action_id, tool=tool)
-    return {"reply": done}
+    return _clear_pending(done)
 
 
 def _needs_approval(state: AssistantState) -> Literal["approve", "done"]:
