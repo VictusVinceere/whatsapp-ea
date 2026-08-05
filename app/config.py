@@ -23,6 +23,14 @@ class Settings:
     }
 
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+    anthropic_model: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+    # Fallback provider, used only when Anthropic is unusable -- no
+    # credit, bad key, rate limited, down. Unset means "no fallback",
+    # which is a valid configuration, not an error.
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
 
     database_url: str = os.getenv("DATABASE_URL", "")

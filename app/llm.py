@@ -4,12 +4,11 @@ AI reasoning loop works before adding router/agent complexity on top.
 """
 from datetime import datetime, timezone
 
-import anthropic
 import structlog
-from app.config import settings
+
+from app.backends import generate
 
 log = structlog.get_logger()
-client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 SYSTEM_PROMPT = """You are an executive assistant on WhatsApp. Keep
 replies short and conversational -- this is chat, not email.
@@ -38,13 +37,13 @@ async def ask_claude(
     a bare classification instead of a chatty reply.
     """
     messages = [*(history or []), {"role": "user", "content": text}]
-    response = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=max_tokens,
+    response = await generate(
         system=system or SYSTEM_PROMPT,
         messages=messages,
+        max_tokens=max_tokens,
     )
-    return response.content[0].text
+    blocks = [b["text"] for b in response["content"] if b["type"] == "text"]
+    return "\n".join(blocks).strip()
 
 
 MAX_TOOL_ROUNDS = 6
@@ -66,7 +65,9 @@ async def run_agent(
     A manual loop rather than the SDK's tool runner because a write has to
     suspend the whole conversation into a LangGraph interrupt -- possibly
     for days, across a process restart. The runner's hooks gate within one
-    process; they can't pause a turn and resume it tomorrow.
+    process; they can't pause a turn and resume it tomorrow. Owning the
+    loop is also what lets `app.backends` swap providers underneath it:
+    the runner is Anthropic-only.
     """
     from app.tools import TOOL_DEFINITIONS, WRITE_TOOLS, run_read_tool
 
@@ -86,32 +87,31 @@ async def run_agent(
     messages = [*(history or []), {"role": "user", "content": text}]
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
+        response = await generate(
             system=dated_system,
-            tools=TOOL_DEFINITIONS,
             messages=messages,
+            tools=TOOL_DEFINITIONS,
+            max_tokens=1024,
         )
 
-        if response.stop_reason != "tool_use":
-            text_blocks = [b.text for b in response.content if b.type == "text"]
+        if response["stop_reason"] != "tool_use":
+            text_blocks = [b["text"] for b in response["content"] if b["type"] == "text"]
             return {"reply": "\n".join(text_blocks).strip() or "..."}
 
-        calls = [b for b in response.content if b.type == "tool_use"]
-        messages.append({"role": "assistant", "content": response.content})
+        calls = [b for b in response["content"] if b["type"] == "tool_use"]
+        messages.append({"role": "assistant", "content": response["content"]})
 
         # A write ends the loop. Anything the model already read stays in
         # `messages`, so the turn resumes with its context intact after
         # the user answers.
-        write = next((c for c in calls if c.name in WRITE_TOOLS), None)
+        write = next((c for c in calls if c["name"] in WRITE_TOOLS), None)
         if write is not None:
-            log.info("tool_write_proposed", tool=write.name)
+            log.info("tool_write_proposed", tool=write["name"])
             return {
                 "pending": {
-                    "name": write.name,
-                    "input": dict(write.input),
-                    "tool_use_id": write.id,
+                    "name": write["name"],
+                    "input": dict(write["input"]),
+                    "tool_use_id": write["id"],
                     "messages": messages,
                 }
             }
@@ -120,12 +120,14 @@ async def run_agent(
         # message -- splitting them teaches the model to stop parallelising.
         results = []
         for call in calls:
-            log.info("tool_call", tool=call.name)
-            output = await run_read_tool(call.name, dict(call.input), conversation_id)
+            log.info("tool_call", tool=call["name"])
+            output = await run_read_tool(
+                call["name"], dict(call["input"]), conversation_id
+            )
             results.append(
                 {
                     "type": "tool_result",
-                    "tool_use_id": call.id,
+                    "tool_use_id": call["id"],
                     "content": output,
                 }
             )

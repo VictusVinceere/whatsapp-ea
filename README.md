@@ -195,6 +195,49 @@ Check `WHATSAPP_ALLOWED_SENDERS` is set before you start, and clear the
 callback URL in the Meta dashboard when you stop — otherwise the live
 line keeps forwarding customer messages into a dead tunnel.
 
+## When Anthropic runs out of credit
+
+`app/backends/` puts a router in front of the model call. Anthropic is
+tried first; if it is unusable, the same turn is retried on Gemini,
+whose free tier means the assistant keeps answering when the Anthropic
+balance hits zero.
+
+```bash
+GEMINI_API_KEY=...     # https://aistudio.google.com/apikey — unset disables fallback
+```
+
+Three things decide whether this is useful or actively harmful:
+
+**Anthropic's message format is the canonical one.** Gemini translates
+in and out inside `app/backends/gemini.py` and nowhere else, so
+`graph.py`, `tools.py`, the approval gate and the checkpointer never
+learn a second provider exists — and a turn can start on one provider
+and finish on the other, because the conversation is portable.
+
+**Falling back is not retrying.** A provider is skipped only when the
+failure is about *that provider* — no credit, bad key, rate limited,
+down. A malformed request fails identically everywhere, so retrying it
+would turn one fast error into N slow ones and report the last
+provider's error instead of the one explaining the bug. The awkward case
+is that credit exhaustion and a bad tool schema are **both** a `400
+invalid_request_error` from the same exception class; only the message
+separates them, so that check is string matching and will break silently
+if Anthropic rewords it.
+
+**Gemini executes tools by itself unless told not to.** Left at its
+default it runs the whole loop and returns only final text — so
+`send_email` would fire with no confirmation, bypassing the approval
+gate entirely. `automatic_function_calling(disable=True)` is the one
+Gemini default here that is a security problem rather than a nuisance.
+
+Watch for `served_by_fallback` in the logs: it is a WARNING because
+replies are then coming from a model the prompts were not tuned against,
+and that shows up as quality drift long before anyone checks billing.
+
+Not to be confused with Anthropic's own `fallbacks` request parameter —
+that triggers on safety refusals only and explicitly does not fire on
+billing or rate-limit errors, so it does not solve this.
+
 ## Logging
 
 Every line is JSON on stdout. Nothing writes a log file — in a container
