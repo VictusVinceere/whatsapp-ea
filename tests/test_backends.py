@@ -332,3 +332,54 @@ async def test_gemini_never_executes_tools_itself(monkeypatch):
     )
 
     assert captured["config"].automatic_function_calling.disable is True
+
+
+def test_thought_signature_survives_the_round_trip():
+    """Gemini 3 rejects a continued tool conversation without it.
+
+    Round one of a tool loop works fine; round two dies with "Function
+    call is missing a thought_signature". Only a multi-round live call
+    catches this -- every single-call test passes without it.
+    """
+    from app.backends.gemini import _from_gemini
+
+    part = types.Part(
+        function_call=types.FunctionCall(name="read_calendar", args={}),
+        thought_signature=b"\x01\x02opaque-bytes",
+    )
+    block = _from_gemini(_fake_response([part]))["content"][0]
+    assert block["_gemini_signature"], "signature must be carried on the block"
+
+    # ...and be decoded back onto the Part when the turn continues.
+    [content] = _to_gemini_contents([{"role": "assistant", "content": [block]}])
+    assert content.parts[0].thought_signature == b"\x01\x02opaque-bytes"
+
+
+def test_anthropic_never_sees_gemini_private_keys():
+    """A turn can start on Gemini and resume on Anthropic.
+
+    The signature rides on the block so it survives checkpointing, but
+    Anthropic rejects unknown keys -- so the Anthropic backend has to
+    strip anything underscore-prefixed before sending.
+    """
+    from app.backends.claude import _strip_foreign
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_gem_x",
+                    "name": "read_email",
+                    "input": {},
+                    "_gemini_signature": "YmFzZTY0",
+                }
+            ],
+        }
+    ]
+    [cleaned] = _strip_foreign(messages)
+    block = cleaned["content"][0]
+    assert "_gemini_signature" not in block
+    assert block["name"] == "read_email", "real fields must survive"
+    assert "_gemini_signature" in messages[0]["content"][0], "must not mutate the caller"

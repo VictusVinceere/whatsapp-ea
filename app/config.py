@@ -29,7 +29,12 @@ class Settings:
     # credit, bad key, rate limited, down. Unset means "no fallback",
     # which is a valid configuration, not an error.
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    # An alias, not a pinned version, on purpose: a pinned `gemini-2.5-flash`
+    # 404s for keys created after Google retires it -- "no longer available
+    # to new users" -- while still being listed by the models endpoint. The
+    # alias tracks whatever the current flash model is, so a new key keeps
+    # working without a code change.
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
 

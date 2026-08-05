@@ -72,6 +72,29 @@ def _flatten(blocks) -> list[dict]:
     return out
 
 
+def _strip_foreign(messages: list[dict]) -> list[dict]:
+    """Drop provider-private keys other backends stashed on blocks.
+
+    Gemini hangs its thought_signature on tool_use blocks so it survives
+    checkpointing. Anthropic rejects unknown keys outright, so a turn
+    that started on Gemini and resumed here would 400 without this.
+    Underscore-prefixed is the convention; each backend cleans its own
+    input rather than trusting the router to know every dialect.
+    """
+    cleaned = []
+    for message in messages:
+        content = message["content"]
+        if isinstance(content, list):
+            content = [
+                {k: v for k, v in b.items() if not k.startswith("_")}
+                if isinstance(b, dict)
+                else b
+                for b in content
+            ]
+        cleaned.append({**message, "content": content})
+    return cleaned
+
+
 async def generate(
     *,
     system: str,
@@ -83,7 +106,7 @@ async def generate(
         "model": settings.anthropic_model,
         "max_tokens": max_tokens,
         "system": system,
-        "messages": messages,
+        "messages": _strip_foreign(messages),
     }
     if tools:
         kwargs["tools"] = tools

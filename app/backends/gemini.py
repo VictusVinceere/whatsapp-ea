@@ -23,6 +23,7 @@ Translation is confined to this file on purpose. Everything outside it
 sees Anthropic-shaped dicts and never learns a second provider exists.
 """
 
+import base64
 import uuid
 
 import structlog
@@ -34,6 +35,11 @@ from app.config import settings
 log = structlog.get_logger()
 
 name = "gemini"
+
+# Tokens reserved for Gemini's thinking, on top of the caller's
+# max_tokens. See the note in generate() for why this exists and why a
+# large value is free.
+THINKING_HEADROOM = 2048
 
 _client = (
     genai.Client(api_key=settings.gemini_api_key)
@@ -135,11 +141,21 @@ def _to_gemini_contents(messages: list[dict]) -> list[types.Content]:
 
             elif kind == "tool_use":
                 id_to_name[block["id"]] = block["name"]
+                # Gemini 3 requires the thought_signature it issued with a
+                # function call to come back with that call on the next
+                # turn. Without it the second round of any tool loop dies
+                # with "Function call is missing a thought_signature".
+                # Round one works fine, so this only shows up once a tool
+                # actually runs and the conversation continues.
+                signature = block.get("_gemini_signature")
                 parts.append(
                     types.Part(
                         function_call=types.FunctionCall(
                             name=block["name"], args=block.get("input") or {}
-                        )
+                        ),
+                        thought_signature=(
+                            base64.b64decode(signature) if signature else None
+                        ),
                     )
                 )
 
@@ -184,16 +200,38 @@ def _from_gemini(response) -> dict:
             blocks.append({"type": "text", "text": part.text})
         call = getattr(part, "function_call", None)
         if call is not None:
-            blocks.append(
-                {
-                    "type": "tool_use",
-                    "id": f"toolu_gem_{uuid.uuid4().hex[:20]}",
-                    "name": call.name,
-                    "input": dict(call.args or {}),
-                }
-            )
+            block = {
+                "type": "tool_use",
+                "id": f"toolu_gem_{uuid.uuid4().hex[:20]}",
+                "name": call.name,
+                "input": dict(call.args or {}),
+            }
+            # Carried on the block so it survives the LangGraph
+            # checkpointer -- an approval can suspend a turn for days, and
+            # the signature has to still be there when it resumes. Base64
+            # because the SDK hands it over as bytes, which the JSON
+            # checkpointer cannot store. The leading underscore marks it
+            # as provider-private; the Anthropic backend strips it.
+            signature = getattr(part, "thought_signature", None)
+            if signature:
+                block["_gemini_signature"] = base64.b64encode(signature).decode()
+            blocks.append(block)
 
     wants_tool = any(b["type"] == "tool_use" for b in blocks)
+
+    # Gemini signals truncation only via finish_reason. Without this a
+    # cut-off answer arrives as an ordinary "end_turn" and is indis-
+    # tinguishable from a complete one -- the user just gets a reply that
+    # stops mid-sentence, and nothing in the logs says why.
+    finish = str(getattr(candidates[0], "finish_reason", "")) if candidates else ""
+    if finish.endswith("MAX_TOKENS"):
+        usage = getattr(response, "usage_metadata", None)
+        log.warning(
+            "gemini_truncated",
+            thinking_tokens=getattr(usage, "thoughts_token_count", None),
+            answer_tokens=getattr(usage, "candidates_token_count", None),
+        )
+
     return {
         "stop_reason": "tool_use" if wants_tool else "end_turn",
         "content": blocks,
@@ -209,7 +247,22 @@ async def generate(
 ) -> dict:
     config = types.GenerateContentConfig(
         system_instruction=system,
-        max_output_tokens=max_tokens,
+        # `max_tokens` does not mean the same thing on both providers, and
+        # the difference silently truncates replies.
+        #
+        # Anthropic runs no thinking here, so its max_tokens is entirely
+        # response. Gemini 3 thinks on every call and cannot be told not
+        # to -- thinking_budget=0 is rejected with a 400, and
+        # thinking_level="low" did not reduce it -- while
+        # max_output_tokens caps thinking *plus* response together.
+        # Passing our 300 straight through gave 59 thinking tokens and 1
+        # answer token: the reply came back as the single word "The".
+        #
+        # The ceiling only permits, it does not allocate: the same
+        # question used 98 thinking tokens whether the cap was 576 or
+        # 2112. So headroom costs nothing when unused, and generous is
+        # the right default.
+        max_output_tokens=max_tokens + THINKING_HEADROOM,
     )
     if tools:
         config.tools = _tools_to_gemini(tools)
