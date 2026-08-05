@@ -79,6 +79,29 @@ def test_gemini_quota_falls_back_but_bad_request_does_not():
     assert gemini_exhausted(malformed) is False
 
 
+def test_gemini_reports_a_rejected_key_as_400_not_401():
+    """Found by a live call, not by reading the docs.
+
+    Gemini answers a bad API key with 400 INVALID_ARGUMENT rather than
+    the 401 nearly every other API uses. Classified naively, a dead
+    Gemini key looks like a malformed request and the router gives up
+    instead of moving on -- the same trap as Anthropic putting spent
+    credit inside a 400.
+    """
+    bad_key = errors.ClientError(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}],
+            }
+        },
+    )
+    assert gemini_exhausted(bad_key) is True
+
+
 # --------------------------------------------------------------------
 # The router itself
 # --------------------------------------------------------------------

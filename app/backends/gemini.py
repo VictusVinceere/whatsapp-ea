@@ -55,10 +55,19 @@ def is_exhausted(exc: Exception) -> bool:
     if isinstance(exc, errors.ServerError):  # 5xx
         return True
     if isinstance(exc, errors.ClientError):
-        # 401/403 bad key, 429 quota exhausted. A 400 is a malformed
-        # request and deliberately excluded -- see the router's note on
-        # why retrying those elsewhere is worse than failing.
-        return exc.code in {401, 403, 429}
+        if exc.code in {401, 403, 429}:  # bad auth, forbidden, quota spent
+            return True
+        if exc.code == 400:
+            # Gemini reports a rejected API key as 400 INVALID_ARGUMENT
+            # with reason API_KEY_INVALID -- not the 401 almost every
+            # other API uses. Found by a live call: without this, a dead
+            # Gemini key is classified as "our request is malformed" and
+            # the router stops instead of trying the next provider.
+            #
+            # Both providers bury a provider-side failure inside a 400
+            # (Anthropic does it for spent credit), so both need a
+            # message check. Everything else at 400 really is our bug.
+            return "API_KEY_INVALID" in str(exc) or "API key not valid" in str(exc)
     return False
 
 
