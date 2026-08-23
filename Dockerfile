@@ -65,4 +65,10 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://localhost:8000/ || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Ensure the schema before serving. app.db is CREATE TABLE IF NOT EXISTS
+# throughout, so this is safe on every start and makes the container
+# self-sufficient against an empty database -- otherwise a fresh deploy
+# starts happily and then fails on the first real message with
+# UndefinedTableError, which surfaces to the user as a generic error reply.
+# exec so uvicorn becomes PID 1 and receives stop signals directly.
+CMD ["sh", "-c", "python -m app.db && exec uvicorn main:app --host 0.0.0.0 --port 8000"]
