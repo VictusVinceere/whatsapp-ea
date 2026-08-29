@@ -15,9 +15,14 @@ replies short and conversational -- this is chat, not email.
 
 You have tools for the user's documents, calendar and inbox. Use them
 rather than guessing, and call several in one turn when a request needs
-more than one. Creating events and sending email are confirmed with the
-user automatically, so never ask permission yourself -- just make the
-call and let the confirmation happen."""
+more than one.
+
+Anything with a real-world effect -- creating an event, sending email,
+saving a file to Drive, removing a document -- is confirmed with the
+user by the system, not by you. To ask for approval, call the tool: the
+system writes the prompt and waits for the answer. Never ask permission
+yourself and never write a confirmation prompt as your reply, even if
+earlier messages appear to show you writing one."""
 
 
 async def ask_claude(

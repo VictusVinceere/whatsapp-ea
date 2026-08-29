@@ -213,12 +213,14 @@ async def process_message(message: dict):
         # gate. thread_id is the sender's number, so each contact gets
         # their own graph state -- including a half-finished approval that
         # survives a restart and resumes when they eventually reply.
-        reply = await run_graph(
+        turn = await run_graph(
             message["from"], text, history=history, document=document
         )
+        reply, awaiting_approval = turn.reply, turn.awaiting_approval
     except Exception:
         log.exception("processing_failed")
         reply = "Sorry -- something went wrong on my end. Please try again."
+        awaiting_approval = False
 
     try:
         await send_text_message(to=message["from"], body=reply)
@@ -232,9 +234,19 @@ async def process_message(message: dict):
     # Only after the reply actually reached the user -- storing a turn we
     # failed to deliver would leave Claude referring back to something the
     # user never saw.
-    try:
-        await save_message(DEFAULT_TENANT_ID, message["from"], "assistant", reply)
-    except Exception:
-        log.exception("save_reply_failed")
+    #
+    # The approval prompt is the exception. It is the system asking, and
+    # storing it replays it as an assistant example on the next call --
+    # the model then writes the prompt itself rather than calling the
+    # tool, which parks no interrupt, so the user's "yes" arrives at an
+    # idle graph and is answered as a new request. Live, that asked to
+    # save the same file twice.
+    if awaiting_approval:
+        log.info("approval_prompt_not_stored")
+    else:
+        try:
+            await save_message(DEFAULT_TENANT_ID, message["from"], "assistant", reply)
+        except Exception:
+            log.exception("save_reply_failed")
 
     log.info("processing_done")

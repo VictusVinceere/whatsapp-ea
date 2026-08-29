@@ -21,7 +21,7 @@ business rules; pending_actions knows nothing about graph position.
 
 import json
 from datetime import datetime, timezone
-from typing import Literal, TypedDict
+from typing import Literal, NamedTuple, TypedDict
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -367,6 +367,22 @@ def set_graph(compiled) -> None:
     _graph = compiled
 
 
+class GraphTurn(NamedTuple):
+    """What to send the user, and whether the graph parked waiting on them.
+
+    `awaiting_approval` exists so the caller can keep the approval prompt
+    out of stored history. The prompt is the system asking, not the
+    assistant talking: replayed as an assistant turn it becomes a worked
+    example, and the model starts writing the prompt as plain text
+    instead of calling the tool. Text raises no interrupt, so the user's
+    "yes" then lands on an idle graph and reads as a fresh request --
+    which is how one Drive save came to be asked for twice.
+    """
+
+    reply: str
+    awaiting_approval: bool
+
+
 def _turn(
     conversation_id: str,
     message: str,
@@ -397,7 +413,7 @@ async def run_graph(
     message: str,
     history: list[dict] | None = None,
     document: dict | None = None,
-) -> str:
+) -> GraphTurn:
     """One WhatsApp message through the graph. Returns what to reply.
 
     A conversation can be mid-approval, so the first job is deciding
@@ -449,6 +465,6 @@ async def run_graph(
     pending = result.get("__interrupt__")
     if pending:
         log.info("graph_interrupted", conversation_id=conversation_id)
-        return pending[0].value
+        return GraphTurn(pending[0].value, awaiting_approval=True)
 
-    return result["reply"]
+    return GraphTurn(result["reply"], awaiting_approval=False)
