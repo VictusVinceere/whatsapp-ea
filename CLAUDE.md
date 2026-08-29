@@ -10,6 +10,7 @@ Dependencies are managed with **uv**, not pip. `uv run` executes inside `.venv` 
 uv sync                            # install deps from uv.lock
 uv add <package>                   # add a dep (updates pyproject.toml + uv.lock)
 uv run python -m app.db            # create/refresh the schema; safe to re-run
+uv run pytest                      # run the suite; needs Postgres up (see below)
 uv run uvicorn main:app --reload   # run the API on :8000
 ngrok http 8000                    # second terminal; expose /webhook to Meta
 ```
@@ -18,7 +19,17 @@ ngrok http 8000                    # second terminal; expose /webhook to Meta
 
 Register the ngrok URL + `/webhook` and `WHATSAPP_VERIFY_TOKEN` in the Meta developer dashboard so `GET /webhook` can complete Meta's one-time verification handshake.
 
-There is no test suite, linter, or formatter configured yet — don't assume `pytest`/`ruff` commands exist.
+**Tests are real and they hit a real database.** `pytest` + `pytest-asyncio` are declared in `[dependency-groups] dev`; run with `uv run pytest`. `[tool.pytest.ini_options]` sets `asyncio_mode = "auto"` (async tests need no decorator) and pins **both** fixture and test loop scopes to `session` — the SQLAlchemy engine is created at import time and its pooled connections bind to the loop that first used them, so a fresh loop per test hands the next test a dead connection ("another operation is in progress"). Don't loosen those loop scopes. `pythonpath = ["."]` exists because `tests/` sits beside `app/` rather than inside an installed package.
+
+`tests/conftest.py` deliberately does **not** mock Postgres: every invariant worth protecting here is enforced *by the database* — a UNIQUE constraint, the conditional `UPDATE`, a `COALESCE` — so mocking it would mock away the thing under test. That means the suite needs the container running first:
+
+```bash
+docker start whatsapp-ea-db
+uv run python -m app.db
+uv run pytest
+```
+
+There is no linter or formatter configured — `ruff` is **not** a declared dependency and has no config block, so don't assume `ruff` commands exist (a stray `.ruff_cache/` is from an ad-hoc run, not project setup).
 
 Postgres runs on **5433** (5432 is taken by another project's container) — `docker run --name whatsapp-ea-db -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=whatsapp_ea -p 5433:5432 -d pgvector/pgvector:pg16`. The schema is not auto-migrated on startup; `uv run python -m app.db` applies every statement in `SCHEMA_STATEMENTS`. All statements are `IF NOT EXISTS`, so it only ever creates — the first `ALTER` requirement means switching to Alembic.
 

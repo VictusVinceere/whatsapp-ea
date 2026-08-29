@@ -83,3 +83,33 @@ def test_a_real_pending_write_still_reaches_the_gate():
 
 def test_absent_pending_is_treated_as_done():
     assert _needs_approval({"reply": "hello"}) == "done"
+
+
+async def test_a_text_message_does_not_erase_the_forwarded_file():
+    """The save_to_drive bug, at the level it happened.
+
+    Cumulative state means every key a turn supplies overwrites what was
+    there. run_graph used to pass `document or {}` on every message, so
+    the moment the user typed anything after forwarding a file, the media
+    id was replaced with an empty dict. Approval then failed with
+    KeyError: 'media_id', reported to the user as a Google rejection for
+    an upload that was never attempted.
+
+    A turn carrying no file must leave the key alone.
+    """
+    from app.graph import _turn
+
+    with_file = _turn(
+        "998900000000",
+        "I just sent you a file called report.pdf",
+        [],
+        {"media_id": "123", "filename": "report.pdf", "mime_type": "application/pdf"},
+    )
+    assert with_file["document"]["media_id"] == "123"
+
+    # The follow-up: "save that to my drive", typed as a separate message.
+    without_file = _turn("998900000000", "save that to my drive", [], None)
+    assert "document" not in without_file, (
+        "a text-only turn must not supply `document`, or it overwrites the "
+        "reference from the turn the file arrived on"
+    )

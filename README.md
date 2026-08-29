@@ -25,7 +25,7 @@ WhatsApp  ──▶  webhook.py  ──▶  graph.py  ──▶  llm.py  ──�
 | `app/tools.py` | The read/write split. Which tools need approval is decided by set membership, never by the model |
 | `app/rag.py` | Chunking, embedding, and the `<=>` similarity search |
 | `app/db.py` | Raw SQL, no ORM. `CONFIRM_ACTION_SQL` is the compare-and-set that makes double-confirm safe |
-| `tests/` | Twenty tests, each one pinning a bug that actually happened |
+| `tests/` | Thirty-six tests, each one pinning a bug that actually happened |
 
 Three ideas do most of the work, and each has a comment explaining the
 failure that produced it:
@@ -467,8 +467,15 @@ at once, upload on approval, and re-key the chunks then.
    needs, however many. RAG runs on pgvector with local embeddings via
    fastembed — **Anthropic has no embeddings API**, so that or Voyage AI
    is the choice.
-8. **Deploy** (last): Docker → DigitalOcean K8s → Terraform. Not before
-   step 7 works locally end to end.
+8. ~~**Deploy**~~ — done, and not the way this line originally planned
+   it. No Kubernetes and no Terraform: a push to `main` builds an image
+   to GHCR tagged with the commit sha, then deploys over SSH with
+   `docker compose pull && up -d` for **this service only**, so the
+   websites, Caddy, Postgres and n8n sharing that box are untouched. The
+   deployed sha is written back to `.env` as `WHATSAPP_TAG`, which is
+   what makes a rollback a one-line pin to an older commit. The last CI
+   step smoke-tests the public webhook by running Meta's own
+   verification handshake against it.
 
 ## Notes
 
@@ -485,6 +492,13 @@ at once, upload on approval, and re-key the chunks then.
   `conversation_id` (who is talking to it). Multi-tenancy is far cheaper
   to design in now than to retrofit — and a similarity search that
   forgets to filter by tenant is a data breach, not a bug.
-- `langgraph` and `langchain-anthropic` are declared in `pyproject.toml`
-  but imported nowhere. They are a plan, not a dependency. `app/llm.py`
-  imports `anthropic` directly, which is available transitively.
+- `langgraph` earns its place on exactly one feature: the durable
+  pause. `interrupt()` in `app/graph.py` plus the `AsyncPostgresSaver`
+  checkpointer compiled once in `main.py`'s lifespan is what lets an
+  approval survive a process restart. That checkpointer speaks psycopg,
+  not asyncpg — hence `checkpointer_dsn()` stripping the SQLAlchemy
+  prefix, and hence `libpq5` in the image.
+- `app/llm.py` imports `anthropic` directly, but `pyproject.toml` only
+  declares `langchain-anthropic` — the SDK is available transitively.
+  Add `anthropic` explicitly if you touch that file's dependency
+  surface.

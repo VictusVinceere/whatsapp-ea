@@ -238,7 +238,16 @@ async def approve_node(state: AssistantState) -> dict:
             # Re-downloaded rather than carried through the approval: the
             # bytes could be megabytes, and pending_actions.payload is a
             # JSONB audit record, not a blob store.
-            media_url = await get_media_url(args["media_id"])
+            media_id = args.get("media_id")
+            if not media_id:
+                # No file reference on this conversation. Nothing was
+                # uploaded, so say that plainly rather than reporting a
+                # Google failure that never happened.
+                return _clear_pending(
+                    "I've lost track of which file you meant. Send it again "
+                    "and I'll save it."
+                )
+            media_url = await get_media_url(media_id)
             data = await download_media(media_url)
             uploaded = await upload_file(
                 token,
@@ -358,6 +367,31 @@ def set_graph(compiled) -> None:
     _graph = compiled
 
 
+def _turn(
+    conversation_id: str,
+    message: str,
+    history: list[dict] | None,
+    document: dict | None,
+) -> dict:
+    """The state update for one incoming message.
+
+    `document` is omitted entirely when this message carries no file.
+    Passing {} instead would overwrite the reference from the turn the
+    file actually arrived on, because state is cumulative per thread and
+    this key has no reducer. That broke the ordinary way people use it:
+    send a file, then ask to save it in a separate message. By approval
+    time the media id was gone.
+    """
+    turn = {
+        "conversation_id": conversation_id,
+        "message": message,
+        "history": history or [],
+    }
+    if document:
+        turn["document"] = document
+    return turn
+
+
 async def run_graph(
     conversation_id: str,
     message: str,
@@ -403,23 +437,11 @@ async def run_graph(
             await _abandon_pending(conversation_id)
             await _graph.ainvoke(Command(resume="no"), config)
             result = await _graph.ainvoke(
-                {
-                    "conversation_id": conversation_id,
-                    "message": message,
-                    "history": history or [],
-                    "document": document or {},
-                },
-                config,
+                _turn(conversation_id, message, history, document), config
             )
     else:
         result = await _graph.ainvoke(
-            {
-                "conversation_id": conversation_id,
-                "message": message,
-                "history": history or [],
-                "document": document or {},
-            },
-            config,
+            _turn(conversation_id, message, history, document), config
         )
 
     # An interrupted run has no "reply" -- what the user should see is the
